@@ -32,12 +32,15 @@ class UltrasoundDataset(Dataset):
     """Dataset for ultrasound images with DINO features."""
 
     def __init__(self, metadata_file, image_dir, resolution=512,
-                 image_transform=None, feat_transform=None, feat_model=None):
+                 image_transform=None, feat_transform=None, extract_features=True):
         self.df = pd.read_csv(metadata_file)
         self.image_dir = Path(image_dir)
         self.resolution = resolution
-        self.feat_model = feat_model
+        self.extract_features = extract_features
         self.feat_transform = feat_transform
+
+        # Don't store model - load it per worker to avoid pickling issues
+        self.feat_model = None
 
         # Image preprocessing
         self.image_transform = image_transform or transforms.Compose([
@@ -51,15 +54,23 @@ class UltrasoundDataset(Dataset):
         return len(self.df)
 
     def __getitem__(self, idx):
+        # Lazy load feature model in worker (avoids pickling issues with spawn)
+        if self.extract_features and self.feat_model is None:
+            from feature_extractor_ultrasound import get_feat_model
+            self.feat_model, _ = get_feat_model("dinov2")
+            self.feat_model.eval()
+            if torch.cuda.is_available():
+                self.feat_model = self.feat_model.cuda()
+
         row = self.df.iloc[idx]
 
         # Load image
-        img_path = self.image_dir / row['image']
+        img_path = self.image_dir / row['image'].split('_')[0] / row['image']
         image = Image.open(img_path).convert('RGB')
         pixel_values = self.image_transform(image)
 
-        # Extract DINO features if model provided
-        if self.feat_model is not None:
+        # Extract DINO features
+        if self.extract_features and self.feat_model is not None:
             with torch.no_grad():
                 feat_input = self.feat_transform(image).unsqueeze(0)
                 if torch.cuda.is_available():
@@ -85,6 +96,7 @@ class SDXLLoRAModule(pl.LightningModule):
         learning_rate=1e-4,
         unet_addition_embed_type="text_latent_addembeddingft",
         train_text_encoder=True,
+        resolution=512,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -138,6 +150,7 @@ class SDXLLoRAModule(pl.LightningModule):
 
         # Training settings
         self.learning_rate = learning_rate
+        self.resolution = resolution
         self.automatic_optimization = True
 
     def _setup_lora(self, rank):
@@ -225,8 +238,10 @@ class SDXLLoRAModule(pl.LightningModule):
 
         # Prepare added_cond_kwargs for SDXL
         # Time IDs: [original_height, original_width, crop_top, crop_left, target_height, target_width]
+        # Use actual resolution (512 for ultrasound, 1024 for default SDXL)
+        res = self.resolution
         add_time_ids = torch.tensor([
-            [1024, 1024, 0, 0, 1024, 1024]
+            [res, res, 0, 0, res, res]
         ]).repeat(bsz, 1).to(self.device, dtype=self.dtype)
 
         added_cond_kwargs = {
@@ -312,33 +327,39 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # Set multiprocessing start method to 'spawn' for CUDA compatibility
+    import multiprocessing
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass  # Already set
+
     # Set seed
     pl.seed_everything(args.seed)
 
-    # Load feature extractor
-    print("Loading DINO feature extractor...")
-    feat_model, _ = get_feat_model("dinov2")
-    feat_model.eval()
-    if torch.cuda.is_available():
-        feat_model = feat_model.cuda()
+    # Get feature transform (model will be loaded per-worker to avoid pickling)
+    print("Setting up dataset...")
     feat_transform = get_transform("dinov2", is_ultrasound=True)
 
-    # Create dataset
+    # Create dataset (features extracted lazily in workers)
     print("Loading dataset...")
     dataset = UltrasoundDataset(
         metadata_file=args.train_data_dir,
         image_dir=args.dataset_dir,
         resolution=args.resolution,
-        feat_model=feat_model,
-        feat_transform=feat_transform
+        feat_transform=feat_transform,
+        extract_features=True
     )
 
+    # Use spawn method with workers for faster data loading
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=True
+        num_workers=args.num_workers if args.num_workers > 0 else 0,
+        pin_memory=True if args.num_workers > 0 else False,
+        persistent_workers=True if args.num_workers > 0 else False,
+        multiprocessing_context='spawn' if args.num_workers > 0 else None
     )
 
     # Create model
@@ -347,7 +368,8 @@ def main():
         pretrained_model_path=args.pretrained_model_name_or_path,
         lora_rank=args.rank,
         learning_rate=args.learning_rate,
-        unet_addition_embed_type=args.unet_addition_embed_type
+        unet_addition_embed_type=args.unet_addition_embed_type,
+        resolution=args.resolution
     )
 
     # Callbacks
@@ -366,12 +388,13 @@ def main():
         name='lightning_logs'
     )
 
-    # Trainer
+    # Trainer (single GPU, no DDP)
     trainer = pl.Trainer(
         default_root_dir=args.output_dir,
         max_steps=args.max_steps,
         accelerator='gpu' if args.gpus > 0 else 'cpu',
-        devices=args.gpus,
+        devices=1,  # Single GPU only
+        strategy='auto',  # No DDP for single GPU
         precision=args.precision,
         accumulate_grad_batches=args.accumulate_grad_batches,
         gradient_clip_val=1.0,
@@ -379,6 +402,7 @@ def main():
         logger=logger,
         log_every_n_steps=50,
         enable_progress_bar=True,
+        num_sanity_val_steps=0,  # Skip validation sanity check
     )
 
     # Train
