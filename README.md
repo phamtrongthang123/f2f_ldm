@@ -13,7 +13,7 @@ In ArXiv, 2024.
 To create the Anaconda environment, run the following command:
 
 ```shell
-conda create -n f2fldm python numpy pillow
+conda create -n f2fldm python==3.12
 conda activate f2fldm
 ```
 
@@ -24,20 +24,20 @@ To install the required dependencies, execute the following commands:
 PyTorch:
 
 ```shell
-conda install pytorch torchvision torchaudio pytorch-cuda=12.1 -c pytorch -c nvidia
+uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 ```
 
 Other packages:
 
 ```shell
-pip install huggingface transformers diffusers pytorch-lightning==2.1.2 timm accelerate datasets
+uv pip install huggingface transformers diffusers pytorch-lightning==2.1.2 timm accelerate datasets numpy pillow
 ```
 
 Replace official diffusers with our customized diffusers:
 
 ```shell
 cd diffusers
-pip install -e .
+uv pip install -e .
 ```
 
 # Run Frozen Section to FFPE Image Translation
