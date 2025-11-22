@@ -153,6 +153,16 @@ class SDXLLoRAModule(pl.LightningModule):
         self.resolution = resolution
         self.automatic_optimization = True
 
+    @property
+    def dtype(self):
+        """Get current dtype based on trainer precision."""
+        if hasattr(self, 'trainer') and self.trainer is not None:
+            if self.trainer.precision == "16-mixed":
+                return torch.float16
+            elif self.trainer.precision == "bf16-mixed":
+                return torch.bfloat16
+        return torch.float32
+
     def _setup_lora(self, rank):
         """Add LoRA layers to UNet attention."""
         self.lora_parameters = []
@@ -211,14 +221,17 @@ class SDXLLoRAModule(pl.LightningModule):
 
     def forward(self, batch):
         """Forward pass - compute loss."""
-        pixel_values = batch['pixel_values']
+        pixel_values = batch['pixel_values'].to(self.device)
         features = batch['features'].to(self.device)
         captions = batch['caption']
 
         # Encode images to latent space
         with torch.no_grad():
-            latents = self.vae.encode(pixel_values).latent_dist.sample()
+            # VAE in float32 to avoid NaN
+            pixel_values_vae = pixel_values.to(dtype=torch.float32)
+            latents = self.vae.encode(pixel_values_vae).latent_dist.sample()
             latents = latents * self.vae.config.scaling_factor
+            latents = latents.to(dtype=self.dtype)
 
         # Sample noise
         noise = torch.randn_like(latents)
@@ -238,16 +251,19 @@ class SDXLLoRAModule(pl.LightningModule):
 
         # Prepare added_cond_kwargs for SDXL
         # Time IDs: [original_height, original_width, crop_top, crop_left, target_height, target_width]
-        # Use actual resolution (512 for ultrasound, 1024 for default SDXL)
         res = self.resolution
         add_time_ids = torch.tensor([
             [res, res, 0, 0, res, res]
-        ]).repeat(bsz, 1).to(self.device, dtype=self.dtype)
+        ], dtype=torch.float32).repeat(bsz, 1).to(self.device)
+
+        # Ensure features are properly shaped and on correct dtype
+        if features.dim() == 1:
+            features = features.unsqueeze(0)
 
         added_cond_kwargs = {
-            "text_embeds": pooled_embeds,
-            "time_ids": add_time_ids,
-            "latent_embeds": features  # Our DINO features
+            "text_embeds": pooled_embeds.to(dtype=self.dtype),
+            "time_ids": add_time_ids.to(dtype=self.dtype),
+            "latent_embeds": features.to(dtype=self.dtype)
         }
 
         # Predict noise
@@ -258,8 +274,18 @@ class SDXLLoRAModule(pl.LightningModule):
             added_cond_kwargs=added_cond_kwargs
         ).sample
 
-        # Compute loss
+        # Compute loss (use float32 for numerical stability)
         loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
+
+        # Check for NaN/Inf
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"WARNING: NaN/Inf loss detected!")
+            print(f"  model_pred range: [{model_pred.min():.4f}, {model_pred.max():.4f}]")
+            print(f"  noise range: [{noise.min():.4f}, {noise.max():.4f}]")
+            print(f"  latents range: [{latents.min():.4f}, {latents.max():.4f}]")
+            print(f"  features range: [{features.min():.4f}, {features.max():.4f}]")
+            # Return zero loss to continue training
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
 
         return loss
 

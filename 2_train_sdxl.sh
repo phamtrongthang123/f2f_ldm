@@ -42,7 +42,7 @@ python train_pl.py \
   --val_check_interval=5000 \
   --rank=8 \
   --gpus=1 \
-  --precision="16-mixed" \
+  --precision="bf16-mixed" \
   --num_workers=4 \
   --seed=42
 
