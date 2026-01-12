@@ -5,6 +5,7 @@ import argparse
 import os
 import random
 import os.path as osp
+import numpy as np
 from tqdm import tqdm
 import pytorch_lightning as pl
 from torch.utils.data import Dataset, DataLoader
@@ -33,17 +34,27 @@ class WGAN_GP_Loss(nn.Module):
 
 class EmbeddingsDataset(Dataset):
     def __init__(self, data_root, phase='train', feat_type=None):
+        def load_embedding(path):
+            if path.endswith(".npy"):
+                return torch.from_numpy(np.load(path))
+            return torch.load(path)
+
         def load_embeddings(paths):
             embeddings = []
             for path in tqdm(paths):
                 if feat_type == "batch":
-                    embeddings.extend(list(torch.load(path).squeeze()))
+                    embeddings.extend(list(load_embedding(path).squeeze()))
                 else:
-                    embeddings.append(torch.load(path).squeeze())
+                    embeddings.append(load_embedding(path).squeeze())
             return embeddings
         
-        self.embeddings_A = load_embeddings(glob.glob(osp.join(data_root, phase+"A", "*.pt")))
-        self.embeddings_B = load_embeddings(glob.glob(osp.join(data_root, phase+"B", "*.pt")))
+        phase_a_dir = osp.join(data_root, phase + "A")
+        phase_b_dir = osp.join(data_root, phase + "B")
+        phase_a_paths = glob.glob(osp.join(phase_a_dir, "*.pt")) + glob.glob(osp.join(phase_a_dir, "*.npy"))
+        phase_b_paths = glob.glob(osp.join(phase_b_dir, "*.pt")) + glob.glob(osp.join(phase_b_dir, "*.npy"))
+
+        self.embeddings_A = load_embeddings(sorted(phase_a_paths))
+        self.embeddings_B = load_embeddings(sorted(phase_b_paths))
 
         print(osp.join(data_root, phase+"A: "), len(self.embeddings_A))
         print(osp.join(data_root, phase+"B: "), len(self.embeddings_B))
@@ -217,6 +228,10 @@ def make_args():
     parser.add_argument('--feat_type', type=str, default=None)
     parser.add_argument('--feat_dim', type=int, default=384)
     parser.add_argument('--batch_size', type=int, default=1024)
+    parser.add_argument('--n_epochs', type=int, default=200)
+    parser.add_argument('--num_workers', type=int, default=16)
+    parser.add_argument('--display_freq', type=int, default=None)
+    parser.add_argument('--print_freq', type=int, default=None)
     parser.add_argument('--save_name', type=str, default='cycleGAN_wgan_gp')
     args = parser.parse_args()
     return args
@@ -226,11 +241,11 @@ if __name__ == '__main__':
     params = {
         'dataroot': args.dataroot,
         'batch_size': args.batch_size,
-        'num_workers': 16,
+        'num_workers': args.num_workers,
         'input_nc': args.feat_dim,
         'output_nc': args.feat_dim,
         'lr': 0.0002,
-        'epochs': 10000,
+        'epochs': args.n_epochs,
         'feat_type': args.feat_type,
     }
 

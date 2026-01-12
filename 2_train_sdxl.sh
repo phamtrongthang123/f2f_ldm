@@ -19,7 +19,7 @@ if command -v conda >/dev/null 2>&1; then
 fi
 
 echo "=========================================="
-echo "Local SDXL training"
+echo "Local SDXL training" 
 echo "GPU: ${CUDA_VISIBLE_DEVICES}"
 echo "Start: $(date)"
 echo "=========================================="
