@@ -1,29 +1,27 @@
 #!/bin/bash
-#SBATCH --job-name=m3_to_m1_et
-#SBATCH --output=slurm_logs/%j.out
-#SBATCH --error=slurm_logs/%j.err
-#SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=4
-#SBATCH --gres=gpu:1
-#SBATCH --mem=32G
-#SBATCH --time=4:00:00
-#SBATCH --partition=gpu
+set -euo pipefail
 
 # Step 4: Train Embedding Translation (m_3 → m_1)
-# This swaps trainA and trainB so CycleGAN learns the reverse direction
+# Local run (single GPU) on device 4.
 
-mkdir -p slurm_logs
+export CUDA_VISIBLE_DEVICES=4
+
+if command -v module >/dev/null 2>&1; then
+  module load python/anaconda-3.14
+fi
+
+if [ -f "$HOME/.bashrc" ]; then
+  source "$HOME/.bashrc"
+fi
+
+if command -v conda >/dev/null 2>&1; then
+  conda activate f2fldm
+fi
 
 echo "=========================================="
 echo "Training ET for m_3 → m_1"
-echo "Job ID: $SLURM_JOB_ID"
+echo "GPU: ${CUDA_VISIBLE_DEVICES}"
 echo "=========================================="
-
-# Activate conda
-module load python/anaconda-3.14
-source ~/.bashrc
-conda activate f2fldm
 
 # Create reversed feature directories (trainA=m_3, trainB=m_1)
 echo "Creating reversed feature directories..."

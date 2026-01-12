@@ -9,7 +9,7 @@ from typing import List, Optional, Tuple, Union
 from pipeline import SDXLDDIMPipeline, SDXLImg2ImgPipeline
 from diffusers import StableDiffusionXLPipeline, UNet2DConditionModelDev, DDIMScheduler
 from embedding_translation import CycleGAN
-from feature_extractor import get_feat_model, get_transform
+from feature_extractor_ultrasound import get_feat_model, get_transform
 
 def list_int_arg(raw_value: str) -> List[int]:
     return [int(item) for item in raw_value.split(',')]

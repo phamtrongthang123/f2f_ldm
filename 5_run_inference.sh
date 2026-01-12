@@ -1,8 +1,27 @@
 #!/bin/bash
-# Step 5: Run inference (m_3 → m_1 translation)
+set -euo pipefail
 
-module load python/anaconda-3.14
-conda activate f2fldm
+# Step 5: Run inference (m_3 → m_1 translation)
+# Local run (single GPU) on device 4.
+
+export CUDA_VISIBLE_DEVICES=4
+
+if command -v module >/dev/null 2>&1; then
+  module load python/anaconda-3.14
+fi
+
+if [ -f "$HOME/.bashrc" ]; then
+  source "$HOME/.bashrc"
+fi
+
+if command -v conda >/dev/null 2>&1; then
+  conda activate f2fldm
+fi
+
+echo "=========================================="
+echo "Local inference"
+echo "GPU: ${CUDA_VISIBLE_DEVICES}"
+echo "=========================================="
 
 # Prepare test set (copy some m_3 images)
 echo "Preparing test set..."

@@ -1,29 +1,28 @@
 #!/bin/bash
-#SBATCH --job-name=m3_to_m1_sdxl
-#SBATCH --output=slurm_logs/%j.out
-#SBATCH --error=slurm_logs/%j.err
-#SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=64
-#SBATCH --gres=gpu:1
-#SBATCH --time=3-00:00:00
-#SBATCH --partition=agpu
-#SBATCH --constraint=public&1a100
+set -euo pipefail
 
 # Step 2: Train SDXL with PyTorch Lightning (both m_1 and m_3)
+# Local run (single GPU) on device 4.
 
-mkdir -p slurm_logs
+export CUDA_VISIBLE_DEVICES=0
+
+module load python/anaconda-3.14
+# if command -v module >/dev/null 2>&1; then
+# fi
+
+# if [ -f "$HOME/.bashrc" ]; then
+#   source "$HOME/.bashrc"
+# fi
+
+if command -v conda >/dev/null 2>&1; then
+  conda activate f2fldm
+fi
 
 echo "=========================================="
-echo "SLURM Job ID: $SLURM_JOB_ID"
-echo "Node: $SLURM_NODELIST"
+echo "Local SDXL training"
+echo "GPU: ${CUDA_VISIBLE_DEVICES}"
 echo "Start: $(date)"
 echo "=========================================="
-
-# Activate conda
-module load python/anaconda-3.14
-source ~/.bashrc
-conda activate f2fldm
 
 # Training config
 DATASET_DIR="data/ultrasound_dataset/train"
@@ -43,7 +42,7 @@ python train_pl.py \
   --rank=8 \
   --gpus=1 \
   --precision="bf16-mixed" \
-  --num_workers=4 \
+  --num_workers=0 \
   --seed=42
 
 echo "=========================================="

@@ -313,8 +313,9 @@ class SDXLLoRAModule(pl.LightningModule):
         # Save LoRA state dict
         lora_state = {}
         for name, module in self.unet.named_modules():
-            if hasattr(module, 'lora_layer'):
-                lora_state[name] = module.lora_layer.state_dict()
+            lora_layer = getattr(module, 'lora_layer', None)
+            if lora_layer is not None:
+                lora_state[name] = lora_layer.state_dict()
 
         checkpoint['lora_state_dict'] = lora_state
 
