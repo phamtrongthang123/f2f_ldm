@@ -63,6 +63,8 @@ class UltrasoundDataset(Dataset):
                 self.feat_model = self.feat_model.cuda()
 
         row = self.df.iloc[idx]
+        domain = str(row["image"]).split("_")[0].lower()
+        is_m3 = domain == "m3"
 
         # Load image
         img_path = self.image_dir / row['image'].split('_')[0] / row['image']
@@ -82,7 +84,8 @@ class UltrasoundDataset(Dataset):
         return {
             'pixel_values': pixel_values,
             'features': features,
-            'caption': row['text']
+            'caption': row['text'],
+            'is_m3': torch.tensor(is_m3, dtype=torch.bool),
         }
 
 
@@ -97,6 +100,8 @@ class SDXLLoRAModule(pl.LightningModule):
         unet_addition_embed_type="text_latent_addembeddingft",
         train_text_encoder=True,
         resolution=512,
+        stripe_weight=0.0,
+        stripe_kernel_size=15,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -152,6 +157,25 @@ class SDXLLoRAModule(pl.LightningModule):
         self.learning_rate = learning_rate
         self.resolution = resolution
         self.automatic_optimization = True
+        self.stripe_weight = stripe_weight
+        self.stripe_kernel_size = stripe_kernel_size
+        self._last_stripe_loss = None
+
+    def _compute_stripe_loss(self, images):
+        if images.numel() == 0:
+            return torch.tensor(0.0, device=images.device, dtype=images.dtype)
+        kernel_size = int(self.stripe_kernel_size)
+        if kernel_size < 3:
+            return torch.tensor(0.0, device=images.device, dtype=images.dtype)
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        col_mean = images.mean(dim=1).mean(dim=1)
+        col_mean = col_mean.unsqueeze(1)
+        kernel = torch.ones(1, 1, kernel_size, device=images.device, dtype=images.dtype) / float(kernel_size)
+        pad = kernel_size // 2
+        col_padded = F.pad(col_mean, (pad, pad), mode="replicate")
+        smooth = F.conv1d(col_padded, kernel)
+        return (col_mean - smooth).abs().mean()
 
     @property
     def dtype(self):
@@ -276,6 +300,38 @@ class SDXLLoRAModule(pl.LightningModule):
 
         # Compute loss (use float32 for numerical stability)
         loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
+        self._last_stripe_loss = None
+
+        if self.stripe_weight > 0:
+            is_m3 = batch.get("is_m3")
+            if is_m3 is not None:
+                mask = is_m3.to(self.device).bool()
+                if mask.any():
+                    noisy_m3 = noisy_latents[mask]
+                    pred_m3 = model_pred[mask]
+                    timesteps_m3 = timesteps[mask]
+                    alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(
+                        device=latents.device, dtype=torch.float32
+                    )
+                    alpha_prod = alphas_cumprod[timesteps_m3].view(-1, 1, 1, 1)
+                    sqrt_alpha = alpha_prod.sqrt()
+                    sqrt_one_minus = (1.0 - alpha_prod).sqrt()
+                    prediction_type = self.noise_scheduler.config.prediction_type or "epsilon"
+                    if prediction_type == "epsilon":
+                        pred_x0 = (noisy_m3.float() - sqrt_one_minus * pred_m3.float()) / sqrt_alpha
+                    elif prediction_type == "v_prediction":
+                        pred_x0 = sqrt_alpha * noisy_m3.float() - sqrt_one_minus * pred_m3.float()
+                    elif prediction_type == "sample":
+                        pred_x0 = pred_m3.float()
+                    else:
+                        raise ValueError(f"Unsupported prediction_type: {prediction_type}")
+
+                    pred_x0 = pred_x0 / self.vae.config.scaling_factor
+                    decoded = self.vae.decode(pred_x0).sample
+                    pred_img = (decoded / 2.0 + 0.5).clamp(0.0, 1.0)
+                    stripe_loss = self._compute_stripe_loss(pred_img)
+                    loss = loss + self.stripe_weight * stripe_loss
+                    self._last_stripe_loss = stripe_loss.detach()
 
         # Check for NaN/Inf
         if torch.isnan(loss) or torch.isinf(loss):
@@ -292,6 +348,8 @@ class SDXLLoRAModule(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         loss = self(batch)
         self.log('train_loss', loss, prog_bar=True)
+        if self._last_stripe_loss is not None:
+            self.log('stripe_loss', self._last_stripe_loss, prog_bar=True)
         return loss
 
     def configure_optimizers(self):
@@ -347,6 +405,8 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--unet_addition_embed_type", type=str,
                        default="text_latent_addembeddingft")
+    parser.add_argument("--stripe_weight", type=float, default=0.0)
+    parser.add_argument("--stripe_kernel_size", type=int, default=15)
 
     return parser.parse_args()
 
@@ -396,7 +456,9 @@ def main():
         lora_rank=args.rank,
         learning_rate=args.learning_rate,
         unet_addition_embed_type=args.unet_addition_embed_type,
-        resolution=args.resolution
+        resolution=args.resolution,
+        stripe_weight=args.stripe_weight,
+        stripe_kernel_size=args.stripe_kernel_size,
     )
 
     # Callbacks

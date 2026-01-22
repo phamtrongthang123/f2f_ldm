@@ -43,7 +43,9 @@ python train_pl.py \
   --gpus=1 \
   --precision="bf16-mixed" \
   --num_workers=0 \
-  --seed=42
+  --seed=42 \
+  --stripe_weight=0.2 \
+  --stripe_kernel_size=15
 
 echo "=========================================="
 echo "✓ SDXL training complete!"

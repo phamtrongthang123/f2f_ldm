@@ -10,6 +10,7 @@ from pipeline import SDXLDDIMPipeline, SDXLImg2ImgPipeline
 from diffusers import StableDiffusionXLPipeline, UNet2DConditionModelDev, DDIMScheduler
 from embedding_translation import CycleGAN
 from feature_extractor_ultrasound import get_feat_model, get_transform
+from bar_removal import load_bar_removal_model, apply_bar_removal
 
 def list_int_arg(raw_value: str) -> List[int]:
     return [int(item) for item in raw_value.split(',')]
@@ -37,6 +38,9 @@ def make_args() -> argparse.Namespace:
     argparser.add_argument("--reg", default=None, choices=["l0", "l1"], help="Regularize changes with l0 or l1 norm.")
     argparser.add_argument("--high_noise_frac", type=float, default=None, help="Fraction of high noise tiles for mixed prompt.")
     argparser.add_argument("--et_weight", type=float, default=1.0, help="Weight for embedding translation.")
+    argparser.add_argument("--bar_removal_model_path", type=str, default=None, help="Path to bar removal model.")
+    argparser.add_argument("--bar_removal_resolution", type=int, default=512, help="Resolution for bar removal preprocessing.")
+    argparser.add_argument("--bar_removal_blend", type=float, default=1.0, help="Blend factor for bar removal output.")
     argparser.add_argument("--skip_existing", action="store_true", help="Skip existing files.")
     return argparser.parse_args()
 
@@ -115,9 +119,14 @@ def load_embedding_translation(args: argparse.Namespace) -> Optional[CycleGAN]:
         return f2f_cyclegan
     return None
 
+def load_bar_removal(args: argparse.Namespace, device: torch.device, weight_dtype: torch.dtype) -> Optional[torch.nn.Module]:
+    if args.bar_removal_model_path:
+        return load_bar_removal_model(args.bar_removal_model_path, device, weight_dtype)
+    return None
+
 def process_image(image_path: str, args: argparse.Namespace, ddim_pipe: SDXLDDIMPipeline, ddpm_pipe: Union[SDXLImg2ImgPipeline, StableDiffusionXLPipeline], 
                   feat_model: Optional[torch.nn.Module], feat_model_transform: Optional[T.Compose], f2f_cyclegan: Optional[CycleGAN], 
-                  device: torch.device, weight_dtype: torch.dtype, output_path: str, tensor_to_pil: T.ToPILImage) -> None:
+                  bar_removal_model: Optional[torch.nn.Module], device: torch.device, weight_dtype: torch.dtype, output_path: str, tensor_to_pil: T.ToPILImage) -> None:
     try:
         original_img = Image.open(image_path).convert("RGB")
     except Exception as e:
@@ -126,7 +135,15 @@ def process_image(image_path: str, args: argparse.Namespace, ddim_pipe: SDXLDDIM
             f.write(image_path + "\n")
         return
 
-    resized_img = original_img.resize((args.target_resolution, args.target_resolution), resample=Image.BILINEAR)
+    working_img = original_img
+    if bar_removal_model is not None:
+        bar_removed = apply_bar_removal(bar_removal_model, original_img, device, args.bar_removal_resolution)
+        if args.bar_removal_blend < 1.0:
+            original_resized = original_img.resize((args.bar_removal_resolution, args.bar_removal_resolution), resample=Image.BILINEAR)
+            bar_removed = Image.blend(original_resized, bar_removed, args.bar_removal_blend)
+        working_img = bar_removed
+
+    resized_img = working_img.resize((args.target_resolution, args.target_resolution), resample=Image.BILINEAR)
     output_dir = os.path.join(output_path, str(args.target_resolution))
     os.makedirs(output_dir, exist_ok=True)
     output_file = os.path.join(output_dir, os.path.basename(image_path))
@@ -180,6 +197,7 @@ def main() -> None:
     ddim_pipe, ddpm_pipe = load_pipelines(args, unet, weight_dtype)
     feat_model, feat_model_transform = load_feature_extractor(args, device)
     f2f_cyclegan = load_embedding_translation(args)
+    bar_removal_model = load_bar_removal(args, device, weight_dtype)
 
     torch.manual_seed(42)
     image_paths = sorted(glob.glob(os.path.join(args.input_path, "*.png")))
@@ -188,7 +206,7 @@ def main() -> None:
 
     for image_path in tqdm(image_paths):
         process_image(image_path, args, ddim_pipe, ddpm_pipe, feat_model, 
-                      feat_model_transform, f2f_cyclegan, device, weight_dtype, 
+                      feat_model_transform, f2f_cyclegan, bar_removal_model, device, weight_dtype, 
                       output_path, tensor_to_pil)
 
 if __name__ == "__main__":
