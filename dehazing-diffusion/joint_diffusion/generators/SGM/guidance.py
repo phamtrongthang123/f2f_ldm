@@ -47,7 +47,7 @@ class Guidance(abc.ABC):
     @tf.function
     def update_fn(self, y, x, t, x_mean, grad_x0_xt=None):
         """One update for guidance"""
-        if self.corruptor.name in ["gaussian", "mnist", "cs", "cs_sine"]:
+        if self.corruptor.name in ["gaussian", "mnist", "cs", "cs_sine", "haze"]:
             x = self.denoise_update(y, x, t, x_mean, grad_x0_xt)
         else:
             raise ValueError(f"Unknown corruptor: {self.corruptor.name}")
@@ -56,7 +56,7 @@ class Guidance(abc.ABC):
     @tf.function
     def joint_update_fn(self, y, x, n, t, x_mean, n_mean, grad_x0_xt, grad_n0_nt):
         """One update for guidance"""
-        if self.corruptor.name in ["gaussian", "mnist", "cs", "cs_sine"]:
+        if self.corruptor.name in ["gaussian", "mnist", "cs", "cs_sine", "haze"]:
             x, n = self.joint_denoise_update(
                 y, x, n, t, x_mean, n_mean, grad_x0_xt, grad_n0_nt
             )
@@ -154,24 +154,31 @@ class PIGDM(Guidance):
             grad_p_y_nt = tf.reshape(grad_p_y_nt, (self.batch_size, *self.noise_shape))
 
         else:
-            # y = beta * x + alpha * n
             alpha = self.corruptor.blend_factor
-            beta = 1 - alpha
+            if self.corruptor.name == "haze":
+                # y = x + alpha * n
+                sigma_t = r_t_squared + q_t_squared
+                residual = y - x_mean - alpha * n_mean
+                grad_p_y_xt = grad_x0_xt * residual / sigma_t
+                grad_p_y_nt = grad_n0_nt * alpha * residual / sigma_t
+            else:
+                # y = beta * x + alpha * n
+                beta = 1 - alpha
 
-            sigma_t = r_t_squared + q_t_squared
+                sigma_t = r_t_squared + q_t_squared
 
-            grad_p_y_xt = (
-                -1
-                * grad_x0_xt
-                * (beta**2 * x_mean - beta * y + alpha * beta * n_mean)
-                / sigma_t
-            )
-            grad_p_y_nt = (
-                -1
-                * grad_n0_nt
-                * (alpha**2 * n_mean - alpha * y + alpha * beta * x_mean)
-                / sigma_t
-            )
+                grad_p_y_xt = (
+                    -1
+                    * grad_x0_xt
+                    * (beta**2 * x_mean - beta * y + alpha * beta * n_mean)
+                    / sigma_t
+                )
+                grad_p_y_nt = (
+                    -1
+                    * grad_n0_nt
+                    * (alpha**2 * n_mean - alpha * y + alpha * beta * x_mean)
+                    / sigma_t
+                )
 
         # data consistency step for x
         x = x + self.lambda_coeff * grad_p_y_xt * r_t_squared
@@ -222,10 +229,14 @@ class DPS(Guidance):
                 Ax = tf.linalg.matmul(_x_mean, self.A_T)
                 norm = tf.linalg.norm((y - Ax - n_mean))
             else:
-                # y = beta * x + alpha * n
                 alpha = self.corruptor.blend_factor
-                beta = 1 - alpha
-                norm = tf.linalg.norm((y - beta * x_mean - alpha * n_mean))
+                if self.corruptor.name == "haze":
+                    # y = x + alpha * n
+                    norm = tf.linalg.norm((y - x_mean - alpha * n_mean))
+                else:
+                    # y = beta * x + alpha * n
+                    beta = 1 - alpha
+                    norm = tf.linalg.norm((y - beta * x_mean - alpha * n_mean))
 
         # chain rule dy_dxt = dy_dx0 * dx0_dxt
         grad_p_y_xt = -1 * tape.gradient(norm, x_mean) * grad_x0_xt

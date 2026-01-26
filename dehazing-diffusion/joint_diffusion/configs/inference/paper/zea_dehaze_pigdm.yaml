@@ -1,0 +1,42 @@
+## Inference parameters
+# path to data root
+data_root: ./data
+# path to data root
+run_id:
+  sgm: ./wandb/REPLACE_TISSUE_RUN/files
+# device
+device: 0
+# random seed
+seed: 123
+# number of images to process
+num_img: 5
+# keep track of images in each iteration and animate at the end
+keep_track: true
+# type of corruption
+corruptor: haze
+# whether to corrupt data and use as pairs or assume data is corrupted
+paired_data: true
+# haze strength (gamma)
+haze_strength: 0.5
+# legacy noise_stddev (used if haze_strength is missing)
+noise_stddev: 0.5
+
+metrics:
+  - psnr
+  - ssim
+models:
+  - sgm
+
+sgm:
+  lambda_coeff: 0.5
+  kappa_coeff: 0.5
+  num_scales: 200
+  sde: simple
+  sigma: 25
+  sampling_method: pc
+  predictor: euler_maruyama
+  corrector: none
+  guidance: pigdm
+  start_diffusion: 0.8
+  corruptor_run_id: ./wandb/REPLACE_HAZE_RUN/files
+  batch_size: 8
