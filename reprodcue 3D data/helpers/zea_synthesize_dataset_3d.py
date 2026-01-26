@@ -31,6 +31,19 @@ import processing  # noqa: E402
 
 
 def _make_probe(n_el: int, aperture: float, center_frequency: float, sampling_frequency: float):
+    """Build a linear-array probe model for ZEA simulations.
+
+    Role:
+        Defines the probe element positions and sampling parameters used by ZEA.
+
+    Example:
+        >>> probe = _make_probe(64, 20e-3, 5e6, 20e6)
+        >>> probe.n_el
+        64
+
+    Output / Expectation:
+        Returns a `zea.probes.Probe` with a (n_el, 3) geometry array. No randomness.
+    """
     probe_geometry = np.stack(
         [
             np.linspace(-aperture / 2, aperture / 2, n_el),
@@ -57,6 +70,20 @@ def _make_scan(
     grid_size_z: int,
     n_ax: int,
 ):
+    """Create a ZEA Scan that defines beamforming geometry and timing.
+
+    Role:
+        Encapsulates transmit angles, sampling grid, and physical parameters for
+        RF simulation and beamforming.
+
+    Example:
+        >>> scan = _make_scan(probe, 3, np.array([0.0]), 1540.0, (-0.02, 0.02), (0.01, 0.05), 64, 128, 1024)
+        >>> scan.grid_size_z
+        128
+
+    Output / Expectation:
+        Returns a `zea.scan.Scan` configured for planar wave transmissions.
+    """
     t0_delays = compute_t0_delays_planewave(
         probe_geometry=probe.probe_geometry,
         polar_angles=angles_rad,
@@ -101,6 +128,22 @@ def _random_scatterers_3d(
     z_bias: tuple[float, float] | None = None,
     magnitude_scale: float = 1.0,
 ):
+    """Sample 3D scatterer positions and magnitudes.
+
+    Role:
+        Generates random scatterers within x/y/z bounds, optionally biased in z
+        to model tissue or haze distributions.
+
+    Example:
+        >>> rng = np.random.default_rng(0)
+        >>> pos, mag = _random_scatterers_3d(rng, 10, (-1, 1), (-0.5, 0.5), (0, 1))
+        >>> pos.shape, mag.shape
+        ((10, 3), (10,))
+
+    Output / Expectation:
+        Returns (positions, magnitudes) as float32 arrays. Positions are in meters,
+        magnitudes are signed Rayleigh samples.
+    """
     x = rng.uniform(xlims[0], xlims[1], n_scat)
     y = rng.uniform(ylims[0], ylims[1], n_scat)
     if z_bias is None:
@@ -123,6 +166,19 @@ def _simulate_frame(
     beamformer: Beamform,
     beamformer_params: dict,
 ):
+    """Simulate and beamform one 2D RF frame from scatterers.
+
+    Role:
+        Runs ZEA RF simulation followed by beamforming to produce a 2D image.
+
+    Example:
+        >>> frame = _simulate_frame(positions, magnitudes, probe, scan, beamformer, params)
+        >>> frame.shape
+        (128, 64)
+
+    Output / Expectation:
+        Returns a float32 2D array (axial x lateral). Values are unnormalized RF.
+    """
     rf_data = simulate_rf(
         scatterer_positions=positions,
         scatterer_magnitudes=magnitudes,
@@ -157,6 +213,21 @@ def _slice_weighted_magnitudes(
     slice_center: float,
     slice_sigma: float,
 ):
+    """Apply a Gaussian weight across elevation to approximate a slice thickness.
+
+    Role:
+        Emphasizes scatterers close to the slice center to mimic elevational
+        sensitivity.
+
+    Example:
+        >>> mags = np.ones(3, dtype=np.float32)
+        >>> ys = np.array([0.0, 1.0e-3, 2.0e-3], dtype=np.float32)
+        >>> _slice_weighted_magnitudes(mags, ys, 0.0, 1.0e-3)
+        array([...], dtype=float32)
+
+    Output / Expectation:
+        Returns magnitudes with the same shape, scaled by a Gaussian weight.
+    """
     if slice_sigma <= 0:
         return magnitudes
     weights = np.exp(-0.5 * ((y_positions - slice_center) / slice_sigma) ** 2).astype(
@@ -175,6 +246,20 @@ def _simulate_slice(
     beamformer: Beamform,
     beamformer_params: dict,
 ):
+    """Simulate a single elevational slice from a 3D scatterer cloud.
+
+    Role:
+        Centers the slice at `slice_center` and weights scatterers by elevation
+        before beamforming a 2D frame.
+
+    Example:
+        >>> slice_img = _simulate_slice(pos, mag, 0.0, 8e-4, probe, scan, beamformer, params)
+        >>> slice_img.ndim
+        2
+
+    Output / Expectation:
+        Returns a 2D float32 image (axial x lateral) for that slice.
+    """
     positions_shifted = positions.copy()
     positions_shifted[:, 1] = positions_shifted[:, 1] - slice_center
     magnitudes_weighted = _slice_weighted_magnitudes(
@@ -186,6 +271,21 @@ def _simulate_slice(
 
 
 def _normalize_and_compand(data: np.ndarray, max_abs: float, mu: float):
+    """Normalize RF values and apply mu-law companding.
+
+    Role:
+        Scales RF values to [-1, 1], maps to [0, 1], then applies mu-law to
+        compress dynamic range for learning.
+
+    Example:
+        >>> x = np.array([-2.0, 0.0, 2.0], dtype=np.float32)
+        >>> y = _normalize_and_compand(x, max_abs=2.0, mu=255.0)
+        >>> y.min() >= 0.0 and y.max() <= 1.0
+        True
+
+    Output / Expectation:
+        Returns float32 array in [0, 1] with same shape as input.
+    """
     if max_abs <= 0:
         return data
     data_norm = np.clip(data / max_abs, -1.0, 1.0)
@@ -197,6 +297,19 @@ def _normalize_and_compand(data: np.ndarray, max_abs: float, mu: float):
 
 
 def _write_dataset(path: Path, data: np.ndarray, key: str):
+    """Write a compressed NPZ dataset to disk.
+
+    Role:
+        Ensures parent folders exist and saves data under a given key.
+
+    Example:
+        >>> _write_dataset(Path("out/train.npz"), np.zeros((1, 2, 3)), "rf")
+        >>> Path("out/train.npz").is_file()
+        True
+
+    Output / Expectation:
+        Writes `path` on disk. No return value.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(path, **{key: data})
 
@@ -217,6 +330,20 @@ def _generate_volume(
     slice_centers: np.ndarray,
     slice_sigma: float,
 ):
+    """Generate one 3D volume by stacking multiple elevational slices.
+
+    Role:
+        Samples a single scatterer cloud (tissue or haze) and simulates a 2D
+        beamformed image for each slice center.
+
+    Example:
+        >>> vol = _generate_volume(rng, "tissue", probe, scan, beamformer, params, (-0.02, 0.02), (-0.004, 0.004), (0.015, 0.05), (0.005, 0.02), 2000, 3500, np.linspace(-0.004, 0.004, 8), 8e-4)
+        >>> vol.shape
+        (8, 128, 64)
+
+    Output / Expectation:
+        Returns a float32 array with shape (n_slices, grid_size_z, grid_size_x).
+    """
     if kind == "tissue":
         positions, magnitudes = _random_scatterers_3d(
             rng,
@@ -274,6 +401,19 @@ def _generate_split(
     slice_centers: np.ndarray,
     slice_sigma: float,
 ):
+    """Generate a split of multiple 3D volumes.
+
+    Role:
+        Repeats `_generate_volume` to build train/val datasets.
+
+    Example:
+        >>> vols = _generate_split(rng, 4, "haze", probe, scan, beamformer, params, (-0.02, 0.02), (-0.004, 0.004), (0.015, 0.05), (0.005, 0.02), 2000, 3500, np.linspace(-0.004, 0.004, 8), 8e-4)
+        >>> vols.shape
+        (4, 8, 128, 64)
+
+    Output / Expectation:
+        Returns a float32 array with shape (n_samples, n_slices, Z, X).
+    """
     volumes = []
     for _ in range(n_samples):
         volume = _generate_volume(
@@ -298,6 +438,18 @@ def _generate_split(
 
 
 def main():
+    """CLI entry point for 3D ZEA synthesis.
+
+    Role:
+        Parses CLI args, generates tissue/haze volumes, compands values, writes
+        NPZ datasets and metadata.
+
+    Example:
+        $ python zea_synthesize_dataset_3d.py --output-root "reprodcue 3D data" --n-train 10 --n-val 2
+
+    Output / Expectation:
+        Writes `tissue/` and `haze/` train/val NPZ files and a metadata JSON file.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-root", default="reprodcue 3D data")
     parser.add_argument("--seed", type=int, default=123)

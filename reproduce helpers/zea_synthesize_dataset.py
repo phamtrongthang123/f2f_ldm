@@ -27,6 +27,19 @@ import processing  # noqa: E402
 
 
 def _make_probe(n_el: int, aperture: float, center_frequency: float, sampling_frequency: float):
+    """Build a linear-array probe model for ZEA simulations.
+
+    Role:
+        Defines the probe element positions and sampling parameters used by ZEA.
+
+    Example:
+        >>> probe = _make_probe(64, 20e-3, 5e6, 20e6)
+        >>> probe.n_el
+        64
+
+    Output / Expectation:
+        Returns a `zea.probes.Probe` with a (n_el, 3) geometry array. No randomness.
+    """
     probe_geometry = np.stack(
         [
             np.linspace(-aperture / 2, aperture / 2, n_el),
@@ -53,6 +66,20 @@ def _make_scan(
     grid_size_z: int,
     n_ax: int,
 ):
+    """Create a ZEA Scan that defines beamforming geometry and timing.
+
+    Role:
+        Encapsulates transmit angles, sampling grid, and physical parameters for
+        RF simulation and beamforming.
+
+    Example:
+        >>> scan = _make_scan(probe, 3, np.array([0.0]), 1540.0, (-0.02, 0.02), (0.01, 0.05), 64, 128, 1024)
+        >>> scan.grid_size_z
+        128
+
+    Output / Expectation:
+        Returns a `zea.scan.Scan` configured for planar wave transmissions.
+    """
     t0_delays = compute_t0_delays_planewave(
         probe_geometry=probe.probe_geometry,
         polar_angles=angles_rad,
@@ -96,6 +123,22 @@ def _random_scatterers(
     z_bias: tuple[float, float] | None = None,
     magnitude_scale: float = 1.0,
 ):
+    """Sample scatterer positions and magnitudes in 2D (x, z).
+
+    Role:
+        Generates random scatterers within x/z bounds, optionally biased in z
+        to model tissue or haze distributions.
+
+    Example:
+        >>> rng = np.random.default_rng(0)
+        >>> pos, mag = _random_scatterers(rng, 10, (-1, 1), (0, 1))
+        >>> pos.shape, mag.shape
+        ((10, 3), (10,))
+
+    Output / Expectation:
+        Returns (positions, magnitudes) as float32 arrays. Positions are in meters,
+        magnitudes are signed Rayleigh samples.
+    """
     x = rng.uniform(xlims[0], xlims[1], n_scat)
     if z_bias is None:
         z = rng.uniform(zlims[0], zlims[1], n_scat)
@@ -118,6 +161,19 @@ def _simulate_frame(
     beamformer: Beamform,
     beamformer_params: dict,
 ):
+    """Simulate and beamform one 2D RF frame from scatterers.
+
+    Role:
+        Runs ZEA RF simulation followed by beamforming to produce a 2D image.
+
+    Example:
+        >>> frame = _simulate_frame(positions, magnitudes, probe, scan, beamformer, params)
+        >>> frame.shape
+        (128, 64)
+
+    Output / Expectation:
+        Returns a float32 2D array (axial x lateral). Values are unnormalized RF.
+    """
     rf_data = simulate_rf(
         scatterer_positions=positions,
         scatterer_magnitudes=magnitudes,
@@ -147,6 +203,21 @@ def _simulate_frame(
 
 
 def _normalize_and_compand(data: np.ndarray, max_abs: float, mu: float):
+    """Normalize RF values and apply mu-law companding.
+
+    Role:
+        Scales RF values to [-1, 1], maps to [0, 1], then applies mu-law to
+        compress dynamic range for learning.
+
+    Example:
+        >>> x = np.array([-2.0, 0.0, 2.0], dtype=np.float32)
+        >>> y = _normalize_and_compand(x, max_abs=2.0, mu=255.0)
+        >>> y.min() >= 0.0 and y.max() <= 1.0
+        True
+
+    Output / Expectation:
+        Returns float32 array in [0, 1] with same shape as input.
+    """
     if max_abs <= 0:
         return data
     data_norm = np.clip(data / max_abs, -1.0, 1.0)
@@ -158,6 +229,19 @@ def _normalize_and_compand(data: np.ndarray, max_abs: float, mu: float):
 
 
 def _write_dataset(path: Path, data: np.ndarray, key: str):
+    """Write a compressed NPZ dataset to disk.
+
+    Role:
+        Ensures parent folders exist and saves data under a given key.
+
+    Example:
+        >>> _write_dataset(Path("out/train.npz"), np.zeros((1, 2, 3)), "rf")
+        >>> Path("out/train.npz").is_file()
+        True
+
+    Output / Expectation:
+        Writes `path` on disk. No return value.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(path, **{key: data})
 
@@ -176,6 +260,19 @@ def _generate_split(
     n_scat_tissue: int,
     n_scat_haze: int,
 ):
+    """Generate a split of multiple 2D RF frames.
+
+    Role:
+        Repeats scatterer sampling and beamforming to build train/val datasets.
+
+    Example:
+        >>> frames = _generate_split(rng, 4, "haze", probe, scan, beamformer, params, (-0.02, 0.02), (0.015, 0.05), (0.005, 0.02), 2000, 3500)
+        >>> frames.shape
+        (4, 128, 64)
+
+    Output / Expectation:
+        Returns a float32 array with shape (n_samples, Z, X).
+    """
     frames = []
     for _ in range(n_samples):
         if kind == "tissue":
@@ -208,6 +305,18 @@ def _generate_split(
 
 
 def main():
+    """CLI entry point for 2D ZEA synthesis.
+
+    Role:
+        Parses CLI args, generates tissue/haze frames, compands values, writes
+        NPZ datasets and metadata.
+
+    Example:
+        $ python zea_synthesize_dataset.py --output-root data/zea_synth --n-train 10 --n-val 2
+
+    Output / Expectation:
+        Writes `tissue/` and `haze/` train/val NPZ files and a metadata JSON file.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-root", default="data/zea_synth")
     parser.add_argument("--seed", type=int, default=123)

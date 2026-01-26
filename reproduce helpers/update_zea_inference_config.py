@@ -9,6 +9,20 @@ import yaml
 
 
 def _load_wandb_config(path: Path) -> dict:
+    """Load a wandb config YAML and unwrap `value` fields.
+
+    Role:
+        Reads a wandb-generated YAML config and returns a flat dict where entries
+        like `{"value": 123}` become `123`.
+
+    Example:
+        >>> cfg = _load_wandb_config(Path("wandb/run-123/files/config.yaml"))
+        >>> isinstance(cfg, dict)
+        True
+
+    Output / Expectation:
+        Returns a plain dict with best-effort unwrapping of wandb `value` nodes.
+    """
     with path.open("r", encoding="utf-8") as handle:
         raw = yaml.safe_load(handle) or {}
     cfg = {}
@@ -21,6 +35,20 @@ def _load_wandb_config(path: Path) -> dict:
 
 
 def _find_latest_run(wandb_dir: Path, dataset_name: str) -> Path | None:
+    """Find the most recently modified wandb run for a given dataset.
+
+    Role:
+        Scans `wandb_dir/**/files/*.yaml` for configs whose `dataset_name`
+        matches the requested dataset, then returns the newest run directory.
+
+    Example:
+        >>> run_dir = _find_latest_run(Path("wandb"), "zea_tissue")
+        >>> run_dir is None or run_dir.is_dir()
+        True
+
+    Output / Expectation:
+        Returns a Path to the run directory or None if no matches exist.
+    """
     candidates = []
     for config_path in wandb_dir.glob("**/files/*.yaml"):
         cfg = _load_wandb_config(config_path)
@@ -34,6 +62,19 @@ def _find_latest_run(wandb_dir: Path, dataset_name: str) -> Path | None:
 
 
 def main():
+    """CLI entry point to update inference config from latest wandb runs.
+
+    Role:
+        Locates the newest `zea_tissue` and `zea_haze` runs and writes their
+        paths into the inference config YAML.
+
+    Example:
+        $ python update_zea_inference_config.py --wandb-dir dehazing-diffusion/joint_diffusion/wandb
+
+    Output / Expectation:
+        Updates `run_id.sgm` and `sgm.corruptor_run_id` in the target config file
+        and prints the new paths.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--wandb-dir",
