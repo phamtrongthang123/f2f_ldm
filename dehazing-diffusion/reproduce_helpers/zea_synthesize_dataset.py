@@ -176,9 +176,8 @@ def _simulate_frame(
     # Batch scatterers to avoid GPU OOM. Inside simulate_rf, the peak tensor
     # has shape (n_scat, n_el, n_el, n_freq) in complex64. With n_el=64 and
     # n_ax=1024 (n_freq=513), each scatterer costs ~64*64*513*8 ≈ 16.8 MB.
-    # 2000 scatterers → ~31 GB which exceeds A100-40GB.
-    # Batching to 500 scatterers keeps peak usage under ~10 GB.
-    _SCAT_BATCH = 500
+    # 200 scatterers → ~3.4 GB peak allocation.
+    _SCAT_BATCH = 200
     n_scat = positions.shape[0]
     rf_data = None
     for start in range(0, n_scat, _SCAT_BATCH):
