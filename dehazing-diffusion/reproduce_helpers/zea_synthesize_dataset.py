@@ -173,15 +173,19 @@ def _simulate_frame(
     Output / Expectation:
         Returns a float32 2D array (axial x lateral). Values are unnormalized RF.
     """
-    # Simulate one transmit at a time to avoid GPU OOM.
-    # The full (n_tx, n_el, n_scat, n_ax) tensor exceeds A100 40GB memory
-    # when all transmits are computed at once.
-    n_tx = scan.n_tx
-    rf_per_tx = []
-    for tx_idx in range(n_tx):
-        rf_single = simulate_rf(
-            scatterer_positions=positions,
-            scatterer_magnitudes=magnitudes,
+    # Batch scatterers to avoid GPU OOM. Inside simulate_rf, the peak tensor
+    # has shape (n_scat, n_el, n_el, n_freq) in complex64. With n_el=64 and
+    # n_ax=1024 (n_freq=513), each scatterer costs ~64*64*513*8 ≈ 16.8 MB.
+    # 2000 scatterers → ~31 GB which exceeds A100-40GB.
+    # Batching to 500 scatterers keeps peak usage under ~10 GB.
+    _SCAT_BATCH = 500
+    n_scat = positions.shape[0]
+    rf_data = None
+    for start in range(0, n_scat, _SCAT_BATCH):
+        end = min(start + _SCAT_BATCH, n_scat)
+        rf_batch = simulate_rf(
+            scatterer_positions=positions[start:end],
+            scatterer_magnitudes=magnitudes[start:end],
             probe_geometry=probe.probe_geometry,
             apply_lens_correction=scan.apply_lens_correction,
             lens_thickness=scan.lens_thickness,
@@ -190,15 +194,17 @@ def _simulate_frame(
             n_ax=scan.n_ax,
             center_frequency=probe.center_frequency,
             sampling_frequency=probe.sampling_frequency,
-            t0_delays=scan.t0_delays[tx_idx : tx_idx + 1],
-            initial_times=scan.initial_times[tx_idx : tx_idx + 1],
+            t0_delays=scan.t0_delays,
+            initial_times=scan.initial_times,
             element_width=scan.element_width,
             attenuation_coef=scan.attenuation_coef,
-            tx_apodizations=scan.tx_apodizations[tx_idx : tx_idx + 1],
+            tx_apodizations=scan.tx_apodizations,
         )
-        rf_per_tx.append(np.array(rf_single))
-
-    rf_data = np.concatenate(rf_per_tx, axis=1)  # (1, n_tx, n_el, n_ax)
+        rf_batch = np.array(rf_batch)
+        if rf_data is None:
+            rf_data = rf_batch
+        else:
+            rf_data += rf_batch
 
     inputs = {beamformer.key: rf_data[0]}
     outputs = beamformer(**inputs, **beamformer_params)

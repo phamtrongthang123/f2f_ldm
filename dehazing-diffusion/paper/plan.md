@@ -662,62 +662,39 @@ score = gcnr(dehazed_region, background_region)
 
 ## Troubleshooting
 
-### ZEA import errors
-- Check ZEA version: `uv pip show --python .venv_zea zea`
-- The API might differ between versions
-- Consult ZEA documentation for your version
 
-### CUDA/GPU errors
-- Ensure PyTorch sees GPU: `python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'No GPU')"`
-- Set `CUDA_VISIBLE_DEVICES=0` if needed
 
 ### GPU OOM during ZEA synthesis
 
 The ZEA `simulate_rf` function builds intermediate tensors of shape
-`(n_tx, n_el, n_scat, n_ax)` in float32. With defaults (n_tx=3, n_el=64,
-n_scat=3500, n_ax=1024) this creates ~31 GB of intermediate data,
-which exceeds A100-40GB memory.
+`(n_scat, n_el, n_el, n_freq)` in **complex64** (8 bytes per element).
+With defaults (n_scat=2000, n_el=64, n_freq=513 from n_ax=1024):
+`2000 × 64 × 64 × 513 × 8 bytes ≈ 31 GB`, which exceeds A100-40GB.
+Note: `n_el` appears **twice** (transmit × receive elements), so it has
+quadratic impact on memory.
 
-**Applied fix**: `_simulate_frame` now loops over transmits one at a time,
-cutting peak GPU memory by ~n_tx (3×). This is transparent to the output.
+**Applied fix**: `_simulate_frame` batches scatterers into groups of 500
+and calls `simulate_rf` per batch, summing the RF output. The simulation
+is linear in scatterers (they are summed inside ZEA), so this is
+mathematically identical. Peak memory drops from ~31 GB to ~8 GB.
+
+**Tuning `_SCAT_BATCH`** (in `_simulate_frame`):
+- Per-scatterer cost: `n_el² × n_freq × 8 bytes` = `64² × 513 × 8` ≈ 16.8 MB
+- 500 scatterers → ~8.2 GB peak (safe for A100-40GB)
+- 250 scatterers → ~4.1 GB (use if other GPU memory pressure exists)
+- 1000 scatterers → ~16.4 GB (use on 80GB A100 for faster throughput)
 
 **Other knobs if OOM still occurs** (ordered by impact):
-- `--n-ax` (default 1024): axial samples per element. Reducing to 512 halves
-  memory. Affects axial resolution.
-- `--n-scat-haze` / `--n-scat-tissue` (default 3500 / 2000): fewer scatterers
-  = less memory. Affects simulation realism.
-- `--n-el` (default 64): probe elements. Reducing to 32 halves memory.
-  Affects lateral resolution.
-- `--n-tx` (default 3): transmit angles. Already handled by per-tx loop,
-  but fewer transmits also means less total work.
+- `--n-el` (default 64): probe elements — **quadratic** effect on memory.
+  Reducing to 32 cuts memory by 4×. Affects lateral resolution.
+- `--n-ax` (default 1024): axial samples. `n_freq = n_ax/2 + 1`. Reducing
+  to 512 roughly halves memory. Affects axial resolution.
+- `--n-scat-haze` / `--n-scat-tissue` (default 3500 / 2000): already
+  handled by batching, but fewer scatterers = fewer batches = faster.
+- `--n-tx` (default 3): ZEA loops over transmits internally, so this
+  affects time but not peak memory.
 - Request an 80 GB A100 with `--constraint=1a100-80` in the SLURM script
-  (if the cluster has them).
+  (if the cluster has them), then increase `_SCAT_BATCH` to ~1000.
 - Set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.95` to let JAX use more of the GPU
   (default is ~75%).
 
-### Memory errors during training
-- Reduce `batch_size` in config
-- Reduce `image_size` if needed
-- Use `limit_n_samples` for quick tests
-
-### wandb errors
-- Use `export WANDB_MODE=offline` to avoid login requirements
-- Check `WANDB_DIR` is writable
-
----
-
-## File Checklist
-
-After completing all steps, you should have:
-
-- [ ] `/home/tp030/f2f_ldm/.venv_zea/` - ZEA virtual environment
-- [ ] `/home/tp030/f2f_ldm/.venv_joint/` - Joint diffusion virtual environment
-- [ ] `/home/tp030/f2f_ldm/reproduce_helpers/` - Renamed from "reproduce helpers"
-- [ ] `/home/tp030/f2f_ldm/data/zea_synth/tissue/{train,val}.npz` - Tissue data
-- [ ] `/home/tp030/f2f_ldm/data/zea_synth/haze/{train,val}.npz` - Haze data
-- [ ] `/home/tp030/f2f_ldm/data/zea_synth/metadata.json` - Synthesis metadata
-- [ ] `joint_diffusion/configs/training/score_zea_tissue.yaml` - Tissue training config
-- [ ] `joint_diffusion/configs/training/score_zea_haze.yaml` - Haze training config
-- [ ] `joint_diffusion/configs/inference/paper/zea_dehaze_pigdm.yaml` - Inference config
-- [ ] Modified `joint_diffusion/datasets.py` - Added ZEA loaders
-- [ ] Modified `joint_diffusion/utils/corruptors.py` - Added HazeCorruptor
