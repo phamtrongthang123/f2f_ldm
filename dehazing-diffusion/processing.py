@@ -13,7 +13,12 @@ from scipy import stats
 from scipy.interpolate import interp1d
 from scipy.signal import correlate2d
 
-from joint_diffusion.utils.utils import translate
+def translate(array, range_from, range_to):
+    """Map values in array from one range to another."""
+    left_min, left_max = range_from
+    right_min, right_max = range_to
+    scaled = (array - left_min) / (left_max - left_min)
+    return right_min + scaled * (right_max - right_min)
 
 
 def companding_tf(

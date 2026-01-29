@@ -509,7 +509,7 @@ rm -rf /home/tp030/f2f_ldm/data/zea_synth_test
 
 ## Phase 4: Generate Synthetic Data
 
-### Step 4.1: Test ZEA API compatibility
+### Step 4.1: Test ZEA API compatibility [done]
 
 ```bash
 cd /home/tp030/f2f_ldm
@@ -523,7 +523,7 @@ from zea.beamform.delays import compute_t0_delays_planewave
 print('All ZEA imports successful')
 "
 ```
-
+this takes a while. 
 If imports fail, check ZEA documentation for correct module paths.
 
 ### Step 4.2: Run synthesis (small test first)
