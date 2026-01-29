@@ -25,7 +25,7 @@ python "$SCRIPT_DIR/zea_synthesize_dataset.py" \
   --n-train 10 --n-val 2 \
   --seed 123
 
-echo "=== Verifying test output ==="
+echo "=== Verifying test output (RF data) ==="
 python -c "
 import numpy as np
 from pathlib import Path
@@ -33,8 +33,15 @@ root = Path('$ROOT_DIR/data/zea_synth_test')
 for kind in ['tissue', 'haze']:
     train = np.load(root / kind / 'train.npz')['rf']
     val = np.load(root / kind / 'val.npz')['rf']
-    print(f'{kind}: train={train.shape}, val={val.shape}, range=[{train.min():.1f}, {train.max():.1f}]')
+    print(f'{kind}: train={train.shape} {train.dtype}, val={val.shape}, range=[{train.min():.2e}, {train.max():.2e}]')
 "
+
+echo "=== Visualizing test output (RF -> B-mode) ==="
+python "$SCRIPT_DIR/visualize.py" \
+  --data-dir "$ROOT_DIR/data/zea_synth_test" \
+  --out-dir "$ROOT_DIR/data/zea_synth_test/output_vis" \
+  --ncols 5 \
+  --dynamic-range 50
 
 echo "=== Running full synthesis (150 train, 38 val) ==="
 python "$SCRIPT_DIR/zea_synthesize_dataset.py" \
@@ -42,7 +49,7 @@ python "$SCRIPT_DIR/zea_synthesize_dataset.py" \
   --n-train 150 --n-val 38 \
   --seed 123
 
-echo "=== Verifying full output ==="
+echo "=== Verifying full output (RF data) ==="
 python -c "
 import numpy as np
 from pathlib import Path
@@ -50,8 +57,15 @@ root = Path('$ROOT_DIR/data/zea_synth')
 for kind in ['tissue', 'haze']:
     train = np.load(root / kind / 'train.npz')['rf']
     val = np.load(root / kind / 'val.npz')['rf']
-    print(f'{kind}: train={train.shape}, val={val.shape}, range=[{train.min():.1f}, {train.max():.1f}]')
+    print(f'{kind}: train={train.shape} {train.dtype}, val={val.shape}, range=[{train.min():.2e}, {train.max():.2e}]')
 "
 
-rm -rf "$ROOT_DIR/data/zea_synth_test"
+echo "=== Visualizing full output (RF -> B-mode) ==="
+python "$SCRIPT_DIR/visualize.py" \
+  --data-dir "$ROOT_DIR/data/zea_synth" \
+  --out-dir "$ROOT_DIR/data/zea_synth/output_vis" \
+  --ncols 10 \
+  --dynamic-range 50
+
 echo "=== Done ==="
+echo "Visualization saved to: $ROOT_DIR/data/zea_synth/output_vis/"
