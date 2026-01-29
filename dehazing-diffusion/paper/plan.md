@@ -58,7 +58,7 @@ data = np.load(npz_path)[npz_key].astype(np.float32)
 
 ---
 
-### Step 2.2: Add Haze Corruptor to `corruptors.py`
+### Step 2.2: Add Haze Corruptor to `corruptors.py` [So you don't need it right now if you're still working on synthesis and training (Phases 4-5). You'll need it before running inference in Phase 6]
 
 **File**: `/home/tp030/f2f_ldm/dehazing-diffusion/joint_diffusion/utils/corruptors.py`
 
@@ -90,163 +90,38 @@ class HazeCorruptor(Corruptor):
 
 ---
 
-### Step 2.3: Create training config for tissue model
+### Step 2.3: Create training config for tissue model [done]
 
 **File**: `/home/tp030/f2f_ldm/dehazing-diffusion/joint_diffusion/configs/training/score_zea_tissue.yaml`
 
-**Action**: Create new file with content:
-```yaml
-# Training parameters
-epochs:
-  desc: Number of epochs to train
-  value: 100
-batch_size:
-  desc: Size of each mini-batch
-  value: 16
-seed:
-  desc: Random seed
-  value: 1234
-lr:
-  desc: Learning rate
-  value: 0.0002
-ema:
-  desc: Exponential moving average of weights
-  value: 0.99999
-embed_dim:
-  desc: Size of embedded time vector
-  value: 256
-save_freq:
-  desc: Save frequency (epochs)
-  value: 10
-eval_freq:
-  desc: Evaluation frequency (epochs)
-  value: 5
-num_img:
-  desc: Number of images to plot
-  value: 16
-
-# Model parameters
-model_name:
-  desc: Name of the generative model
-  value: score
-score_backbone:
-  desc: Backbone architecture
-  value: NCSNv2
-sde:
-  desc: SDE type
-  value: simple
-sigma:
-  desc: Sigma value in SDE
-  value: 25.0
-num_scales:
-  desc: Number of noise scales
-  value: 1000
-reduce_mean:
-  value: false
-likelihood_weighting:
-  value: false
-normalization:
-  desc: Normalization type
-  value: batch
-channels:
-  desc: Number of channels
-  value: 32
-kernel_size:
-  value: 3
-upmode:
-  value: upconv
-activation:
-  value: relu
-drop_prob:
-  value: null
-
-# Sampling parameters
-sampling_method:
-  value: pc
-predictor:
-  value: euler_maruyama
-corrector:
-  value: none
-n_steps_each:
-  value: 1
-noise_removal:
-  value: true
-probability_flow:
-  value: false
-snr:
-  value: 0.17
-
-# Data parameters
-data_root:
-  desc: Path to data root
-  value: null
-dataset_name:
-  desc: Dataset name
-  value: zea_tissue
-image_size:
-  desc: Image size [axial, lateral]
-  value: [128, 64]
-image_range:
-  value: [0, 1]
-color_mode:
-  value: grayscale
-npz_key:
-  desc: Key in NPZ file
-  value: rf
-```
+Key parameters (from paper Section 3.2.4):
+- `batch_size: 8`, `lr: 1e-4`, `epochs: 100`
+- `channels: 32`, `kernel_size: 3` (NCSNv2)
+- `image_size: [1024, 64]`, `dataset_name: zea_tissue`
 
 ---
 
-### Step 2.4: Create training config for haze model
+### Step 2.4: Create training config for haze model [done]
 
 **File**: `/home/tp030/f2f_ldm/dehazing-diffusion/joint_diffusion/configs/training/score_zea_haze.yaml`
 
-**Action**: Copy `score_zea_tissue.yaml` and change only:
-```yaml
-dataset_name:
-  desc: Dataset name
-  value: zea_haze
-```
+Same as tissue config, only `dataset_name: zea_haze`.
 
 ---
 
-### Step 2.5: Create inference config
+### Step 2.5: Create inference config [done]
 
 **File**: `/home/tp030/f2f_ldm/dehazing-diffusion/joint_diffusion/configs/inference/paper/zea_dehaze_pigdm.yaml`
 
-**Action**: Create the `paper/` directory and file:
-```yaml
-# Inference config for ZEA dehazing with ΠGDM
-
-run_id:
-  sgm: null  # Filled by update_zea_inference_config.py
-
-# Data parameters
-data_root: null
-batch_size: 8
-image_size: [128, 64]
-image_range: [0, 1]
-color_mode: grayscale
-npz_key: rf
-
-# Corruption parameters
-paired_data: true
-corruptor: haze
-noise_stddev: 0.5  # gamma (haze strength)
-
-# SGM parameters
-sgm:
-  corruptor_run_id: null  # Filled by update_zea_inference_config.py
-  n_steps: 1000
-  snr: 0.17
-
-# Denoiser
-denoiser: sgm
-```
+Key parameters (from paper Section 3.2.4):
+- `lambda_coeff: 0.5`, `kappa_coeff: 0.5` (paper recommends ~0.5 for both)
+- `num_scales: 200` (T=200 diffusion steps)
+- `guidance: pigdm`, `corruptor: haze`
+- `run_id.sgm` and `sgm.corruptor_run_id` need to be filled after training
 
 ---
 
-### Step 2.6: Shell scripts [done]
+### Step 2.6: Shell scripts 
 
 - `/home/tp030/f2f_ldm/dehazing-diffusion/reproduce_helpers/zea_synth_run.sh` - Runs synthesis then visualization
 - `/home/tp030/f2f_ldm/dehazing-diffusion/reproduce_helpers/slurm_zea_synth.sh` - SLURM job submission
