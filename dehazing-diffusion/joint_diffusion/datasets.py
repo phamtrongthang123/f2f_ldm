@@ -469,9 +469,8 @@ class ZeaDataset(Dataset):
 
     def __init__(self, npz_path, npz_key="rf", image_range=(0, 1), limit_n=None):
         data = np.load(npz_path)[npz_key].astype(np.float32)
-        # Stored shape: (N, n_tx, n_ax, n_el) — use first transmit as channel
-        # (N, n_tx, n_ax, n_el) -> (N, 1, n_ax, n_el)
-        data = data[:, 0:1, :, :]
+        # Stored shape: (N, n_tx, n_ax, n_el) — use all transmits as channels
+        # Already in (N, C, H, W) format where C=n_tx
         if limit_n:
             data = data[:limit_n]
         # Normalize to image_range
@@ -515,6 +514,7 @@ def _get_zea_dataset(config, kind: str):
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=shuffle)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
 
-    config.image_shape = [1, *config.get("image_size", [128, 64])]
+    n_tx = train_ds.data.shape[1]  # number of transmits = number of channels
+    config.image_shape = [n_tx, *config.get("image_size", [128, 64])]
 
     return train_loader, val_loader

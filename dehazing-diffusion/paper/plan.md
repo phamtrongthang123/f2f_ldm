@@ -46,6 +46,16 @@ uv pip install --python .venv_joint -r dehazing-diffusion/joint_diffusion/requir
 
 **File**: `/home/tp030/f2f_ldm/dehazing-diffusion/joint_diffusion/datasets.py`
 
+`ZeaDataset` loads stored RF data with shape `(N, n_tx, n_ax, n_el)` and uses all transmits as channels:
+
+```python
+data = np.load(npz_path)[npz_key].astype(np.float32)
+# Stored shape: (N, n_tx, n_ax, n_el) — use all transmits as channels
+# Already in (N, C, H, W) format where C=n_tx
+```
+
+`image_shape` is set dynamically from the data: `[n_tx, *image_size]`. This means changing `n_tx` in the synthesis script (e.g. from 3 to 15) requires no code changes downstream — the dataset loader, model `in_channels`, and everything else adapts automatically.
+
 ---
 
 ### Step 2.2: Add Haze Corruptor to `corruptors.py`
@@ -236,69 +246,10 @@ denoiser: sgm
 
 ---
 
-### Step 2.6: Fix synthesis script paths
+### Step 2.6: Shell scripts [done]
 
-**File**: `/home/tp030/f2f_ldm/reproduce_helpers/zea_synthesize_dataset.py`
-
-**Action**: Update lines 24-26 to handle the renamed folder:
-```python
-REPO_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_ROOT / "dehazing-diffusion"))
-```
-
-Verify this resolves to `/home/tp030/f2f_ldm/dehazing-diffusion`.
-
----
-
-### Step 2.7: Update shell scripts for renamed folder
-
-**File**: `/home/tp030/f2f_ldm/reproduce_helpers/run_zea_synthesis.sh`
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-
-source "$ROOT_DIR/.venv_zea/bin/activate"
-
-python "$SCRIPT_DIR/zea_synthesize_dataset.py" \
-  --output-root "$ROOT_DIR/data/zea_synth"
-```
-
-**File**: `/home/tp030/f2f_ldm/reproduce_helpers/train_zea_models.sh`
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-JD_DIR="$ROOT_DIR/dehazing-diffusion/joint_diffusion"
-
-source "$ROOT_DIR/.venv_joint/bin/activate"
-
-export WANDB_MODE=${WANDB_MODE:-offline}
-export WANDB_DIR=${WANDB_DIR:-$JD_DIR/wandb}
-
-pushd "$JD_DIR" >/dev/null
-python train.py -c configs/training/score_zea_tissue.yaml --data_root "$ROOT_DIR/data"
-python train.py -c configs/training/score_zea_haze.yaml --data_root "$ROOT_DIR/data"
-popd >/dev/null
-```
-
-**File**: `/home/tp030/f2f_ldm/reproduce_helpers/run_zea_inference.sh`
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-JD_DIR="$ROOT_DIR/dehazing-diffusion/joint_diffusion"
-
-source "$ROOT_DIR/.venv_joint/bin/activate"
-
-pushd "$JD_DIR" >/dev/null
-python inference.py -e paper/zea_dehaze_pigdm -t denoise -m sgm --data_root "$ROOT_DIR/data"
-popd >/dev/null
-```
+- `/home/tp030/f2f_ldm/dehazing-diffusion/reproduce_helpers/zea_synth_run.sh` - Runs synthesis then visualization
+- `/home/tp030/f2f_ldm/dehazing-diffusion/reproduce_helpers/slurm_zea_synth.sh` - SLURM job submission
 
 ---
 
@@ -389,26 +340,11 @@ print('All component shape tests PASSED')
 
 ### Step 3.3: Layer 3 — Dataset loading round-trip
 
-Verify the ZEA dataset loader returns correct shapes and value ranges. Requires a small dummy dataset (create one inline).
+Verify the ZEA dataset loader returns correct shapes and value ranges. Requires a small synthesized dataset (generate with `zea_synth_run.sh` first).
 
 ```bash
 cd /home/tp030/f2f_ldm
 source .venv_joint/bin/activate
-python -c "
-import numpy as np
-from pathlib import Path
-
-# Create tiny dummy dataset for testing
-dummy_root = Path('data/zea_synth_test')
-for kind in ['tissue', 'haze']:
-    (dummy_root / kind).mkdir(parents=True, exist_ok=True)
-    train = np.random.randint(0, 256, (8, 128, 64), dtype=np.uint8)
-    val = np.random.randint(0, 256, (2, 128, 64), dtype=np.uint8)
-    np.savez(dummy_root / kind / 'train.npz', rf=train)
-    np.savez(dummy_root / kind / 'val.npz', rf=val)
-print('Dummy dataset created')
-"
-
 cd dehazing-diffusion/joint_diffusion
 python -c "
 import torch
@@ -418,21 +354,18 @@ from utils.utils import AttrDict
 for name in ['zea_tissue', 'zea_haze']:
     config = AttrDict({
         'dataset_name': name,
-        'data_root': '../../data_test',
+        'data_root': '../../data',
         'batch_size': 4,
         'image_range': [0, 1],
         'shuffle': True,
         'seed': 42,
         'npz_key': 'rf',
     })
-    # Point to test data
-    config.data_root = '../../data/zea_synth_test/..'
     train, val = get_dataset(config)
     batch = next(iter(train))
     assert isinstance(batch, torch.Tensor), f'Expected torch.Tensor, got {type(batch)}'
-    assert batch.shape[1] == 1, f'Expected channel dim=1, got {batch.shape[1]}'
-    assert batch.shape[2:] == (128, 64), f'Expected spatial (128,64), got {batch.shape[2:]}'
-    assert 0.0 <= batch.min() <= batch.max() <= 1.0, f'Values out of [0,1]: [{batch.min():.3f}, {batch.max():.3f}]'
+    assert batch.shape[1] == 3, f'Expected channel dim=n_tx=3, got {batch.shape[1]}'
+    assert batch.shape[2:] == (1024, 64), f'Expected spatial (1024,64), got {batch.shape[2:]}'
     print(f'{name}: batch={batch.shape}, range=[{batch.min():.3f}, {batch.max():.3f}] OK')
 
 print()
@@ -451,7 +384,7 @@ cd dehazing-diffusion/joint_diffusion
 
 export WANDB_MODE=disabled
 python train.py -c configs/training/score_zea_tissue.yaml \
-  --data_root ../../data/zea_synth_test/.. \
+  --data_root ../../data \
   --epochs 1 \
   --limit_n_samples 8 \
   --batch_size 2
@@ -473,7 +406,7 @@ from utils.utils import AttrDict
 
 config = AttrDict({
     'dataset_name': 'zea_tissue',
-    'data_root': '../../data/zea_synth_test/..',
+    'data_root': '../../data',
     'batch_size': 4,
     'image_range': [0, 1],
     'image_size': [128, 64],
@@ -499,15 +432,9 @@ print('Corruptor test PASSED')
 "
 ```
 
-### Step 3.6: Layer 6 — Cleanup test data
-
-```bash
-rm -rf /home/tp030/f2f_ldm/data/zea_synth_test
-```
-
 ---
 
-## Phase 4: Generate Synthetic Data
+## Phase 4: Generate Synthetic Data [done]
 
 ### Step 4.1: Test ZEA API compatibility [done]
 
@@ -523,57 +450,75 @@ from zea.beamform.delays import compute_t0_delays_planewave
 print('All ZEA imports successful')
 "
 ```
-this takes a while.
-If imports fail, check ZEA documentation for correct module paths.
 
-### Step 4.2: Run synthesis (small test first)
+### Step 4.2: Synthesis script [done]
+
+**File**: `/home/tp030/f2f_ldm/dehazing-diffusion/reproduce_helpers/zea_synthesize_dataset.py`
+
+- Uses `phantoms.fish()` for tissue (same as simulation reference, ~104 scatterers)
+- Haze adds 30-60 extra random scatterers with lower magnitudes (0.3-0.8)
+- Stores raw float32 RF data from `simulate_rf`, no normalization
+- Stores all transmits: shape `(N, n_tx, n_ax, n_el)` — e.g. `(N, 3, 1024, 64)` with default `n_tx=3`
+- `n_tx` is configurable in the synthesis script; downstream code adapts automatically
+- Output structure: `{output_root}/tissue/train.npz`, `val.npz`, `{output_root}/haze/train.npz`, `val.npz`
+- NPZ key: `rf`
+
+### Step 4.3: Run small test synthesis
 
 ```bash
 cd /home/tp030/f2f_ldm
-source .venv_zea/bin/activate
-KERAS_BACKEND=jax python dehazing-diffusion/reproduce_helpers/zea_synthesize_dataset.py \
-  --output-root data/zea_synth \
-  --n-train 10 --n-val 2 \
-  --seed 123
+bash dehazing-diffusion/reproduce_helpers/zea_synth_run.sh
 ```
 
-### Step 4.3: Verify output
+This runs 10 train + 2 val samples and then visualization.
+
+### Step 4.4: Verify output
 
 ```bash
 python -c "
 import numpy as np
 from pathlib import Path
 
-root = Path('data/zea_synth')
+root = Path('data/zea_synth_test')
 for kind in ['tissue', 'haze']:
     train = np.load(root / kind / 'train.npz')['rf']
     val = np.load(root / kind / 'val.npz')['rf']
-    print(f'{kind}: train={train.shape}, val={val.shape}, range=[{train.min():.1f}, {train.max():.1f}]')
+    print(f'{kind}: train={train.shape}, val={val.shape}, dtype={train.dtype}')
 "
 ```
 
 Expected output:
 ```
-tissue: train=(10, 128, 64), val=(2, 128, 64), range=[0.0, 255.0]
-haze: train=(10, 128, 64), val=(2, 128, 64), range=[0.0, 255.0]
+tissue: train=(10, 3, 1024, 64), val=(2, 3, 1024, 64), dtype=float32
+haze: train=(10, 3, 1024, 64), val=(2, 3, 1024, 64), dtype=float32
 ```
 
-### Step 4.4: Run full synthesis
+### Step 4.5: Visualization script [done]
+
+**File**: `/home/tp030/f2f_ldm/dehazing-diffusion/reproduce_helpers/visualize_dataset.py`
+
+- Loads stored RF data from npz files
+- Adds channel dim `[:, :, :, np.newaxis]` to get `(n_tx, n_ax, n_el, 1)`
+- Feeds directly into `zea.Pipeline` for B-mode reconstruction (same flow as simulation reference)
+- Shows tissue (top row) and haze (bottom row) side by side
+- Saves to `{data_root}/visualization.png`
+
+### Step 4.6: Run full synthesis
 
 ```bash
 cd /home/tp030/f2f_ldm
 source .venv_zea/bin/activate
 KERAS_BACKEND=jax python dehazing-diffusion/reproduce_helpers/zea_synthesize_dataset.py \
   --output-root data/zea_synth \
-  --n-train 150 --n-val 38 \
-  --seed 123
+  --n-train 1000 --n-val 100 \
+  --seed 42
 ```
 
 ---
 
 ## Phase 5: Train Diffusion Models
 
-### Step 4.1: Test dataset loading
+### Step 5.1: Test dataset loading
 
 ```bash
 cd /home/tp030/f2f_ldm
@@ -599,7 +544,7 @@ print(f'Value range: [{batch.min():.3f}, {batch.max():.3f}]')
 "
 ```
 
-### Step 4.2: Train tissue model
+### Step 5.2: Train tissue model
 
 ```bash
 cd /home/tp030/f2f_ldm
@@ -611,7 +556,7 @@ python train.py -c configs/training/score_zea_tissue.yaml \
   --data_root ../../data
 ```
 
-### Step 4.3: Train haze model
+### Step 5.3: Train haze model
 
 ```bash
 python train.py -c configs/training/score_zea_haze.yaml \
@@ -622,7 +567,7 @@ python train.py -c configs/training/score_zea_haze.yaml \
 
 ## Phase 6: Run Joint Inference
 
-### Step 5.1: Update inference config with trained model paths
+### Step 6.1: Update inference config with trained model paths
 
 ```bash
 cd /home/tp030/f2f_ldm
@@ -632,7 +577,7 @@ python reproduce_helpers/update_zea_inference_config.py \
   --inference-config dehazing-diffusion/joint_diffusion/configs/inference/paper/zea_dehaze_pigdm.yaml
 ```
 
-### Step 5.2: Run dehazing inference
+### Step 6.2: Run dehazing inference
 
 ```bash
 cd dehazing-diffusion/joint_diffusion
@@ -644,11 +589,11 @@ python inference.py -e paper/zea_dehaze_pigdm -t denoise -m sgm \
 
 ## Phase 7: Evaluate Results
 
-### Step 6.1: Check output files
+### Step 7.1: Check output files
 
 Results will be saved in `dehazing-diffusion/joint_diffusion/results/`.
 
-### Step 6.2: Compute metrics
+### Step 7.2: Compute metrics
 
 Use the gCNR (generalized contrast-to-noise ratio) from `processing.py`:
 ```python
@@ -662,39 +607,11 @@ score = gcnr(dehazed_region, background_region)
 
 ## Troubleshooting
 
-
-
 ### GPU OOM during ZEA synthesis
 
-The ZEA `simulate_rf` function builds intermediate tensors of shape
-`(n_scat, n_el, n_el, n_freq)` in **complex64** (8 bytes per element).
-With defaults (n_scat=2000, n_el=64, n_freq=513 from n_ax=1024):
-`2000 × 64 × 64 × 513 × 8 bytes ≈ 31 GB`, which exceeds A100-40GB.
-Note: `n_el` appears **twice** (transmit × receive elements), so it has
-quadratic impact on memory.
+The `simulate_rf` function memory scales with scatterer count. The fish phantom uses ~104 scatterers which is well within GPU limits. The haze phantom adds 30-60 more (total ~134-164), still safe.
 
-**Applied fix**: `_simulate_frame` batches scatterers into groups of 500
-and calls `simulate_rf` per batch, summing the RF output. The simulation
-is linear in scatterers (they are summed inside ZEA), so this is
-mathematically identical. Peak memory drops from ~31 GB to ~8 GB.
-
-**Tuning `_SCAT_BATCH`** (in `_simulate_frame`):
-- Per-scatterer cost: `n_el² × n_freq × 8 bytes` = `64² × 513 × 8` ≈ 16.8 MB
-- 500 scatterers → ~8.2 GB peak (safe for A100-40GB)
-- 250 scatterers → ~4.1 GB (use if other GPU memory pressure exists)
-- 1000 scatterers → ~16.4 GB (use on 80GB A100 for faster throughput)
-
-**Other knobs if OOM still occurs** (ordered by impact):
-- `--n-el` (default 64): probe elements — **quadratic** effect on memory.
-  Reducing to 32 cuts memory by 4×. Affects lateral resolution.
-- `--n-ax` (default 1024): axial samples. `n_freq = n_ax/2 + 1`. Reducing
-  to 512 roughly halves memory. Affects axial resolution.
-- `--n-scat-haze` / `--n-scat-tissue` (default 3500 / 2000): already
-  handled by batching, but fewer scatterers = fewer batches = faster.
-- `--n-tx` (default 3): ZEA loops over transmits internally, so this
-  affects time but not peak memory.
-- Request an 80 GB A100 with `--constraint=1a100-80` in the SLURM script
-  (if the cluster has them), then increase `_SCAT_BATCH` to ~1000.
-- Set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.95` to let JAX use more of the GPU
-  (default is ~75%).
-
+If OOM occurs with larger phantoms:
+- Reduce scatterer count
+- Set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.95` to let JAX use more GPU memory
+- Request a larger GPU in SLURM
