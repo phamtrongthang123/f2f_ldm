@@ -9,7 +9,6 @@ from typing import Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
-import tensorflow as tf
 from scipy import stats
 from scipy.interpolate import interp1d
 from scipy.signal import correlate2d
@@ -25,7 +24,6 @@ def companding_tf(
     A: float = 87.6,
 ):
     """Companding according to the A- or μ-law algorithm.
-    Tensorflow versions of companding.
 
     Invertible compressing operation. Used to compress
     dynamic range of input data (and subsequently expand).
@@ -40,7 +38,7 @@ def companding_tf(
     for small signals.
 
     Args:
-    array (ndarray): input array. expected to be in range [-1, 1].
+        array (ndarray): input array. expected to be in range [-1, 1].
         expand (bool, optional): If set to False (default),
             data is compressed, else expanded.
         comp_type (str): either `a` or `mu`.
@@ -50,44 +48,39 @@ def companding_tf(
     Returns:
         ndarray: companded array. has values in range [-1, 1].
     """
-    array = tf.clip_by_value(array, -1, 1)
-    array = tf.cast(array, tf.float32)
-    A = tf.cast(A, tf.float32)
-    mu = tf.cast(mu, tf.float32)
+    array = np.clip(array, -1, 1).astype(np.float32)
+    A = np.float32(A)
+    mu = np.float32(mu)
 
     if comp_type is None:
         comp_type = "mu"
     assert comp_type.lower() in ["a", "mu"]
 
     def mu_law_compress(x):
-        y = tf.sign(x) * tf.math.log(1.0 + mu * tf.abs(x)) / tf.math.log(1.0 + mu)
-        return y
+        return np.sign(x) * np.log(1.0 + mu * np.abs(x)) / np.log(1.0 + mu)
 
     def mu_law_expand(y):
-        x = tf.sign(y) * ((1 + mu) ** (tf.abs(y)) - 1.0) / mu
-        return x
+        return np.sign(y) * ((1 + mu) ** np.abs(y) - 1.0) / mu
 
     def a_law_compress(x):
-        x_sign = tf.sign(x)
-        x_abs = tf.abs(x)
-        A_log = tf.math.log(A)
+        x_sign = np.sign(x)
+        x_abs = np.abs(x)
+        A_log = np.log(A)
 
         val1 = x_sign * A * x_abs / (1.0 + A_log)
-        val2 = x_sign * (1.0 + tf.math.log(A * x_abs)) / (1.0 + A_log)
+        val2 = x_sign * (1.0 + np.log(A * x_abs)) / (1.0 + A_log)
 
-        y = tf.where((x_abs >= 0) & (x_abs < (1 / A)), val1, val2)
-        return y
+        return np.where((x_abs >= 0) & (x_abs < (1 / A)), val1, val2)
 
     def a_law_expand(y):
-        y_sign = tf.sign(y)
-        y_abs = tf.abs(y)
-        A_log = tf.math.log(A)
+        y_sign = np.sign(y)
+        y_abs = np.abs(y)
+        A_log = np.log(A)
 
         val1 = y_sign * y_abs * (1.0 + A_log) / A
-        val2 = y_sign * tf.exp(y_abs * (1.0 + A_log) - 1.0) / A
+        val2 = y_sign * np.exp(y_abs * (1.0 + A_log) - 1.0) / A
 
-        x = tf.where((y_abs >= 0) & (y_abs < (1 / (1 + A_log))), val1, val2)
-        return x
+        return np.where((y_abs >= 0) & (y_abs < (1 / (1 + A_log))), val1, val2)
 
     if comp_type.lower() == "mu":
         if expand:

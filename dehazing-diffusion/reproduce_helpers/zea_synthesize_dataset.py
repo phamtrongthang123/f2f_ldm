@@ -10,8 +10,6 @@ from pathlib import Path
 
 import numpy as np
 
-# Ensure Keras backend is set before importing zea.
-os.environ.setdefault("KERAS_BACKEND", "tensorflow")
 os.environ.setdefault("ZEA_DISABLE_CACHE", "1")
 
 import zea  # noqa: E402
@@ -22,7 +20,7 @@ from zea.scan import Scan  # noqa: E402
 from zea.simulator import simulate_rf  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_ROOT / "dehazing-diffusion"))
+sys.path.insert(0, str(REPO_ROOT))
 import processing  # noqa: E402
 
 

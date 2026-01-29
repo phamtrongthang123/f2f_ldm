@@ -42,92 +42,9 @@ uv pip install --python .venv_joint -r dehazing-diffusion/joint_diffusion/requir
 
 ## Phase 2: Code Modifications (TF → PyTorch Port)
 
-### Step 2.1: Add ZEA dataset loader to `datasets.py`
+### Step 2.1: Add ZEA dataset loader to `datasets.py` [done]
 
 **File**: `/home/tp030/f2f_ldm/dehazing-diffusion/joint_diffusion/datasets.py`
-
-**Action**: Add `zea_tissue` and `zea_haze` to `_DATASETS` list (line 18):
-```python
-_DATASETS = [
-    "mnist",
-    "celeba",
-    "sinenoise",
-    "sinenoise1d",
-    "tmnist",
-    "zea_tissue",
-    "zea_haze",
-]
-```
-
-**Action**: Add the dataset loader function (after line 453):
-```python
-import torch
-from torch.utils.data import Dataset, DataLoader
-
-class ZeaDataset(Dataset):
-    """PyTorch Dataset for ZEA synthetic RF data (tissue or haze)."""
-
-    def __init__(self, npz_path, npz_key="rf", image_range=(0, 1), limit_n=None):
-        data = np.load(npz_path)[npz_key].astype(np.float32) / 255.0
-        # Add channel dim: (N, H, W) -> (N, 1, H, W)
-        self.data = data[:, np.newaxis, :, :]
-        if limit_n:
-            self.data = self.data[:limit_n]
-        # Normalize to image_range
-        lo, hi = image_range
-        self.data = self.data * (hi - lo) + lo
-        self.data = torch.from_numpy(self.data)
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        return self.data[idx]
-
-
-def _get_zea_dataset(config, kind: str):
-    """Load ZEA synthetic RF dataset (tissue or haze).
-
-    Returns:
-        Tuple of (train_loader, val_loader)
-    """
-    data_root = Path(config.data_root)
-    npz_key = config.get("npz_key", "rf")
-    image_range = config.get("image_range", [0, 1])
-    batch_size = config.get("batch_size", 16)
-    shuffle = config.get("shuffle", True)
-    seed = config.get("seed", None)
-    limit_n = config.get("limit_n_samples", None)
-
-    train_path = data_root / "zea_synth" / kind / "train.npz"
-    val_path = data_root / "zea_synth" / kind / "val.npz"
-
-    if not train_path.exists():
-        raise FileNotFoundError(f"ZEA dataset not found: {train_path}")
-
-    train_ds = ZeaDataset(train_path, npz_key, image_range, limit_n)
-    val_ds = ZeaDataset(val_path, npz_key, image_range, limit_n)
-
-    print(f"Using {len(train_ds)} files for training.")
-    print(f"Using {len(val_ds)} files for validation.")
-
-    g = torch.Generator()
-    if seed:
-        g.manual_seed(seed)
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=shuffle, generator=g)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
-
-    return train_loader, val_loader
-```
-
-**Action**: Update `get_dataset()` function (around line 56, add before the `datasets = train, test` line):
-```python
-    if dataset_name.lower() == "zea_tissue":
-        train, test = _get_zea_dataset(config, "tissue")
-    if dataset_name.lower() == "zea_haze":
-        train, test = _get_zea_dataset(config, "haze")
-```
 
 ---
 
@@ -592,7 +509,7 @@ rm -rf /home/tp030/f2f_ldm/data/zea_synth_test
 
 ## Phase 4: Generate Synthetic Data
 
-### Step 3.1: Test ZEA API compatibility
+### Step 4.1: Test ZEA API compatibility
 
 ```bash
 cd /home/tp030/f2f_ldm
@@ -609,18 +526,18 @@ print('All ZEA imports successful')
 
 If imports fail, check ZEA documentation for correct module paths.
 
-### Step 3.2: Run synthesis (small test first)
+### Step 4.2: Run synthesis (small test first)
 
 ```bash
 cd /home/tp030/f2f_ldm
 source .venv_zea/bin/activate
-python reproduce_helpers/zea_synthesize_dataset.py \
+python dehazing-diffusion/reproduce_helpers/zea_synthesize_dataset.py \
   --output-root data/zea_synth \
   --n-train 10 --n-val 2 \
   --seed 123
 ```
 
-### Step 3.3: Verify output
+### Step 4.3: Verify output
 
 ```bash
 python -c "
@@ -641,10 +558,12 @@ tissue: train=(10, 128, 64), val=(2, 128, 64), range=[0.0, 255.0]
 haze: train=(10, 128, 64), val=(2, 128, 64), range=[0.0, 255.0]
 ```
 
-### Step 3.4: Run full synthesis
+### Step 4.4: Run full synthesis
 
 ```bash
-python reproduce_helpers/zea_synthesize_dataset.py \
+cd /home/tp030/f2f_ldm
+source .venv_zea/bin/activate
+python dehazing-diffusion/reproduce_helpers/zea_synthesize_dataset.py \
   --output-root data/zea_synth \
   --n-train 150 --n-val 38 \
   --seed 123
