@@ -196,32 +196,6 @@ class MNISTCorruptor(Corruptor):
         self.noise_stddev = self.blend_factor
 
 
-@register_corruptor(name="haze")
-class HazeCorruptor(Corruptor):
-    """Haze corruptor, adds structured haze to data."""
-
-    def __init__(self, config, train=True):
-        haze_dataset = config.get("haze_dataset_name", "zea_haze")
-        super().__init__(config, dataset_name=haze_dataset, model=True)
-
-        self.load_corruptor_dataset(train)
-
-        assert config.image_shape == self.config.image_shape, (
-            f"Haze data shape {self.config.image_shape} should match "
-            f"image data shape {config.image_shape}."
-        )
-
-        self.haze_strength = config.get("haze_strength", config.get("noise_stddev", 1.0))
-        self.blend_factor = self.haze_strength
-        self.noise_stddev = self.haze_strength
-
-    def corrupt(self, images):
-        batch_size = tf.gather(tf.shape(images), 0)
-        self.noise = tf.gather(next(self.gen), tf.range(batch_size))
-        noisy_images = images + self.blend_factor * self.noise
-        return noisy_images
-
-
 @register_corruptor(name="gaussian")
 class GaussianCorruptor(Corruptor):
     """Gaussian corruptor, adds gaussian noise."""

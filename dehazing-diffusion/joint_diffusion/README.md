@@ -90,16 +90,6 @@ python inference.py -e paper/celeba_mnist_pigdm -t denoise -m sgm
 ## Getting started
 ### Install environment
 Install an environment with TF2.10 and Pytorch, both GPU enabled. All the other dependencies can be found in the [requirements](./requirements) folder. See [installation environment](#installation-environment) for more detailed instructions.
-
-If you prefer `uv`, make sure to use Python 3.10 (required by `tensorflow-gpu<2.11`) and run:
-```bash
-uv python install 3.10
-uv venv .venv --python 3.10
-source .venv/bin/activate
-uv pip install -r requirements/requirements.txt
-# Optional: CUDA 12.1 PyTorch wheels
-uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-```
 ### Download weights
 Pretrained weights should be automatically downloaded to the [./checkpoints](./checkpoints) folder, but can also be manually downloaded [here](https://drive.google.com/uc?id=1OxC_9MMf1W7sO2adeENpvrH2atsjThTZ). Each dataset is a different folder in the checkpoints directory and all the different models have a separate nested folder again for each dataset. In those model folders, besides the checkpoint, a training config `.yaml` file is provided for each trained model (necessary for inference, to build the model again).
 
@@ -151,16 +141,6 @@ Make sure to set the `data_root` parameter in the inference config (for instance
 
 ### Installation environment
 Install packages in a conda environment with TF2 and Pytorch (latter only needed for the GLOW baseline).
-
-If you prefer `uv`:
-```bash
-uv python install 3.10
-uv venv .venv --python 3.10
-source .venv/bin/activate
-uv pip install -r requirements/requirements.txt
-# Optional: CUDA 12.1 PyTorch wheels
-uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-```
 
 ```bash
 conda create -n joint-diffusion python=3.10

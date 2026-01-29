@@ -21,8 +21,6 @@ _DATASETS = [
     "sinenoise",
     "sinenoise1d",
     "tmnist",
-    "zea_tissue",
-    "zea_haze",
 ]
 
 
@@ -56,10 +54,6 @@ def get_dataset(config):
         train, test = _get_sine_noise1D_dataset(config)
     if dataset_name.lower() == "tmnist":
         train, test = _get_tmnist(config)
-    if dataset_name.lower() == "zea_tissue":
-        train, test = _get_zea_dataset(config, "tissue")
-    if dataset_name.lower() == "zea_haze":
-        train, test = _get_zea_dataset(config, "haze")
 
     datasets = train, test
     dataset = datasets[datasets != None]
@@ -456,102 +450,3 @@ def _get_sine_noise1D_dataset(config):
         output_signature=tf.TensorSpec(shape=image_shape, dtype=tf.float32),
     )
     return dataset, dataset
-
-
-def _load_zea_array(path: Path, key: str | None):
-    """Load a numpy array from a .npz or .npy file."""
-    if path.suffix == ".npy":
-        return np.load(path)
-    if path.suffix == ".npz":
-        with np.load(path) as data:
-            if key and key in data:
-                return data[key]
-            # fallback to first key
-            return data[list(data.keys())[0]]
-    raise ValueError(f"Unsupported file type: {path}")
-
-
-def _get_zea_dataset(config, dataset_kind: str):
-    """Loads a ZEA-synthesized RF dataset stored as numpy arrays."""
-    data_root = Path(config.data_root)
-    dataset_dir = data_root / "zea_synth" / dataset_kind
-    if not dataset_dir.is_dir():
-        raise FileNotFoundError(
-            f"Dataset directory not found: {dataset_dir}. "
-            "Expected a folder with train/val .npz or .npy files."
-        )
-
-    train_name = config.get("train_file", "train.npz")
-    val_name = config.get("val_file", "val.npz")
-    npz_key = config.get("npz_key", "rf")
-
-    train_path = dataset_dir / train_name
-    val_path = dataset_dir / val_name
-
-    if not train_path.is_file():
-        raise FileNotFoundError(f"Training file not found: {train_path}")
-
-    train_data = _load_zea_array(train_path, npz_key)
-
-    if val_path.is_file():
-        val_data = _load_zea_array(val_path, npz_key)
-    else:
-        validation_split = config.get("validation_split", 0.2)
-        train_data, val_data = train_test_split(
-            train_data, test_size=validation_split, random_state=config.get("seed")
-        )
-
-    image_range = config.get("image_range", [0, 1])
-    input_range = config.get("input_range", [0, 255])
-    color_mode = config.get("color_mode", "grayscale")
-    seed = config.get("seed", None)
-    shuffle = config.get("shuffle", True)
-    batch_size = config.get("batch_size")
-    image_size = config.get("image_size")
-
-    if image_size is None:
-        if train_data.ndim == 4:
-            image_size = train_data.shape[1:3]
-        else:
-            image_size = train_data.shape[1:3]
-    if isinstance(image_size, int):
-        image_size = (image_size, image_size)
-
-    train_dataset = tf.data.Dataset.from_tensor_slices(train_data)
-    test_dataset = tf.data.Dataset.from_tensor_slices(val_data)
-
-    if shuffle:
-        train_dataset = train_dataset.shuffle(len(train_data), seed=seed)
-        test_dataset = test_dataset.shuffle(len(val_data), seed=seed)
-
-    if config.get("limit_n_samples"):
-        train_dataset = train_dataset.take(config.limit_n_samples)
-        test_dataset = test_dataset.take(config.limit_n_samples)
-
-    print(f"Using {len(train_data)} files for training.")
-    print(f"Using {len(val_data)} files for validation.")
-
-    if batch_size:
-        train_dataset = train_dataset.batch(batch_size)
-        test_dataset = test_dataset.batch(batch_size)
-
-    norm_layer = get_normalization_layer(
-        *image_range, x_min=input_range[0], x_max=input_range[1]
-    )
-
-    transforms = []
-    transforms.append(lambda x: tf.cast(x, tf.float32))
-    if train_data.ndim == 3:
-        transforms.append(lambda x: tf.expand_dims(x, axis=-1))
-    transforms.append(lambda x: tf.image.resize(x, image_size))
-    transforms.append(lambda x: norm_layer(x))
-    if color_mode == "rgb":
-        transforms.append(lambda x: grayscale_to_random_rgb(x, (None, *image_size, 3)))
-
-    for transform in transforms:
-        train_dataset = train_dataset.map(transform, num_parallel_calls=AUTOTUNE)
-        test_dataset = test_dataset.map(transform, num_parallel_calls=AUTOTUNE)
-
-    train_dataset = train_dataset.prefetch(buffer_size=AUTOTUNE)
-
-    return train_dataset, test_dataset
