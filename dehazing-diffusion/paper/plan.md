@@ -514,7 +514,7 @@ rm -rf /home/tp030/f2f_ldm/data/zea_synth_test
 ```bash
 cd /home/tp030/f2f_ldm
 source .venv_zea/bin/activate
-python -c "
+KERAS_BACKEND=torch python -c "
 from zea.probes import Probe
 from zea.scan import Scan
 from zea.ops import Beamform

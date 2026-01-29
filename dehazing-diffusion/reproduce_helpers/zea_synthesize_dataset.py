@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
+os.environ.setdefault("KERAS_BACKEND", "torch")
 os.environ.setdefault("ZEA_DISABLE_CACHE", "1")
 
 import zea  # noqa: E402
