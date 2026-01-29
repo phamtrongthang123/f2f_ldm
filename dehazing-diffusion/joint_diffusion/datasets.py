@@ -468,9 +468,10 @@ class ZeaDataset(Dataset):
     """PyTorch Dataset for ZEA synthetic RF data (tissue or haze)."""
 
     def __init__(self, npz_path, npz_key="rf", image_range=(0, 1), limit_n=None):
-        data = np.load(npz_path)[npz_key].astype(np.float32) / 255.0
-        # Add channel dim: (N, H, W) -> (N, 1, H, W)
-        data = data[:, np.newaxis, :, :]
+        data = np.load(npz_path)[npz_key].astype(np.float32)
+        # Stored shape: (N, n_tx, n_ax, n_el) — use first transmit as channel
+        # (N, n_tx, n_ax, n_el) -> (N, 1, n_ax, n_el)
+        data = data[:, 0:1, :, :]
         if limit_n:
             data = data[:limit_n]
         # Normalize to image_range
