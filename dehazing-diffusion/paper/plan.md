@@ -27,7 +27,7 @@ mv "reproduce helpers" dehazing-diffusion/reproduce_helpers
 ```bash
 cd /home/tp030/f2f_ldm
 uv venv .venv_zea
-uv pip install --python .venv_zea zea torch numpy
+uv pip install --python .venv_zea zea "jax[cuda12]" numpy
 ```
 
 ### Step 1.3: Create joint_diffusion environment [done]
@@ -514,7 +514,7 @@ rm -rf /home/tp030/f2f_ldm/data/zea_synth_test
 ```bash
 cd /home/tp030/f2f_ldm
 source .venv_zea/bin/activate
-KERAS_BACKEND=torch python -c "
+KERAS_BACKEND=jax python -c "
 from zea.probes import Probe
 from zea.scan import Scan
 from zea.ops import Beamform
@@ -523,7 +523,7 @@ from zea.beamform.delays import compute_t0_delays_planewave
 print('All ZEA imports successful')
 "
 ```
-this takes a while. 
+this takes a while.
 If imports fail, check ZEA documentation for correct module paths.
 
 ### Step 4.2: Run synthesis (small test first)
@@ -531,7 +531,7 @@ If imports fail, check ZEA documentation for correct module paths.
 ```bash
 cd /home/tp030/f2f_ldm
 source .venv_zea/bin/activate
-python dehazing-diffusion/reproduce_helpers/zea_synthesize_dataset.py \
+KERAS_BACKEND=jax python dehazing-diffusion/reproduce_helpers/zea_synthesize_dataset.py \
   --output-root data/zea_synth \
   --n-train 10 --n-val 2 \
   --seed 123
@@ -563,7 +563,7 @@ haze: train=(10, 128, 64), val=(2, 128, 64), range=[0.0, 255.0]
 ```bash
 cd /home/tp030/f2f_ldm
 source .venv_zea/bin/activate
-python dehazing-diffusion/reproduce_helpers/zea_synthesize_dataset.py \
+KERAS_BACKEND=jax python dehazing-diffusion/reproduce_helpers/zea_synthesize_dataset.py \
   --output-root data/zea_synth \
   --n-train 150 --n-val 38 \
   --seed 123
@@ -670,6 +670,30 @@ score = gcnr(dehazed_region, background_region)
 ### CUDA/GPU errors
 - Ensure PyTorch sees GPU: `python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'No GPU')"`
 - Set `CUDA_VISIBLE_DEVICES=0` if needed
+
+### GPU OOM during ZEA synthesis
+
+The ZEA `simulate_rf` function builds intermediate tensors of shape
+`(n_tx, n_el, n_scat, n_ax)` in float32. With defaults (n_tx=3, n_el=64,
+n_scat=3500, n_ax=1024) this creates ~31 GB of intermediate data,
+which exceeds A100-40GB memory.
+
+**Applied fix**: `_simulate_frame` now loops over transmits one at a time,
+cutting peak GPU memory by ~n_tx (3×). This is transparent to the output.
+
+**Other knobs if OOM still occurs** (ordered by impact):
+- `--n-ax` (default 1024): axial samples per element. Reducing to 512 halves
+  memory. Affects axial resolution.
+- `--n-scat-haze` / `--n-scat-tissue` (default 3500 / 2000): fewer scatterers
+  = less memory. Affects simulation realism.
+- `--n-el` (default 64): probe elements. Reducing to 32 halves memory.
+  Affects lateral resolution.
+- `--n-tx` (default 3): transmit angles. Already handled by per-tx loop,
+  but fewer transmits also means less total work.
+- Request an 80 GB A100 with `--constraint=1a100-80` in the SLURM script
+  (if the cluster has them).
+- Set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.95` to let JAX use more of the GPU
+  (default is ~75%).
 
 ### Memory errors during training
 - Reduce `batch_size` in config

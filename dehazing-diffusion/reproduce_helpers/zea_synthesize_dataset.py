@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-os.environ.setdefault("KERAS_BACKEND", "torch")
+os.environ.setdefault("KERAS_BACKEND", "jax")
 os.environ.setdefault("ZEA_DISABLE_CACHE", "1")
 
 import zea  # noqa: E402
@@ -173,23 +173,32 @@ def _simulate_frame(
     Output / Expectation:
         Returns a float32 2D array (axial x lateral). Values are unnormalized RF.
     """
-    rf_data = simulate_rf(
-        scatterer_positions=positions,
-        scatterer_magnitudes=magnitudes,
-        probe_geometry=probe.probe_geometry,
-        apply_lens_correction=scan.apply_lens_correction,
-        lens_thickness=scan.lens_thickness,
-        lens_sound_speed=scan.lens_sound_speed,
-        sound_speed=scan.sound_speed,
-        n_ax=scan.n_ax,
-        center_frequency=probe.center_frequency,
-        sampling_frequency=probe.sampling_frequency,
-        t0_delays=scan.t0_delays,
-        initial_times=scan.initial_times,
-        element_width=scan.element_width,
-        attenuation_coef=scan.attenuation_coef,
-        tx_apodizations=scan.tx_apodizations,
-    )
+    # Simulate one transmit at a time to avoid GPU OOM.
+    # The full (n_tx, n_el, n_scat, n_ax) tensor exceeds A100 40GB memory
+    # when all transmits are computed at once.
+    n_tx = scan.n_tx
+    rf_per_tx = []
+    for tx_idx in range(n_tx):
+        rf_single = simulate_rf(
+            scatterer_positions=positions,
+            scatterer_magnitudes=magnitudes,
+            probe_geometry=probe.probe_geometry,
+            apply_lens_correction=scan.apply_lens_correction,
+            lens_thickness=scan.lens_thickness,
+            lens_sound_speed=scan.lens_sound_speed,
+            sound_speed=scan.sound_speed,
+            n_ax=scan.n_ax,
+            center_frequency=probe.center_frequency,
+            sampling_frequency=probe.sampling_frequency,
+            t0_delays=scan.t0_delays[tx_idx : tx_idx + 1],
+            initial_times=scan.initial_times[tx_idx : tx_idx + 1],
+            element_width=scan.element_width,
+            attenuation_coef=scan.attenuation_coef,
+            tx_apodizations=scan.tx_apodizations[tx_idx : tx_idx + 1],
+        )
+        rf_per_tx.append(np.array(rf_single))
+
+    rf_data = np.concatenate(rf_per_tx, axis=1)  # (1, n_tx, n_el, n_ax)
 
     inputs = {beamformer.key: rf_data[0]}
     outputs = beamformer(**inputs, **beamformer_params)
