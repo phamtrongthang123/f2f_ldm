@@ -1,549 +1,278 @@
-# Agent Prompt: Port TensorFlow Score-Based Diffusion to PyTorch & Reproduce Paper
+# Agent Prompt: Port Remaining TF Files to PyTorch
 
 ## Task Overview
 
-**Primary Goal**: Port the TensorFlow-based score-based diffusion model code in `joint_diffusion/` to PyTorch while maintaining the same import structure. The user only works with PyTorch and needs the code to be fully functional without TensorFlow dependencies.
+Continue porting the TensorFlow-dependent files in `joint_diffusion/` to PyTorch so that `train.py` and `inference.py` can run without TensorFlow.
 
-**Secondary Goal**: Reproduce the results from the paper "Dehazing Ultrasound using Diffusion Models" (IEEE TMI 2024) using synthetic data generated with ZEA. /home/tp030/f2f_ldm/dehazing-diffusion/paper
+**Previous session** already ported the 6 core SGM files (all passing `test_sanity.py`). This session must port the remaining ~10 files that still import TensorFlow.
 
-DO NOT RUN any training or inference yet. Focus solely on porting the code and ensuring it can be imported and basic operations run without errors and sanity tests ready to verify correctness.
+**Working directory**: `/scrfs/storage/tp030/home/f2f_ldm/dehazing-diffusion/joint_diffusion`
 
-## Paper Summary
-
-**Title**: Dehazing Ultrasound using Diffusion Models  
-**Authors**: Tristan Stevens et al. (TU Eindhoven + Philips Research)  
-**Published**: IEEE Transactions on Medical Imaging, October 2024
-
-### Key Concepts
-
-1. **Problem**: Cardiac ultrasound images suffer from "haze" - structured noise from multipath reflections through skin/fat/muscle layers
-
-2. **Approach**: Joint posterior sampling with two diffusion models:
-   - Model 1: `s_θ(x,t)` - learns clean tissue distribution `p(x)`
-   - Model 2: `s_φ(h,t)` - learns haze distribution `p(h)`
-
-3. **Measurement Model**: `y = x + h` (additive in RF domain)
-
-4. **Inference**: PIGDM (Pseudo-Inverse Guidance Diffusion Model) for joint posterior sampling from `p(x,h|y)`
-
-5. **Key Innovation**: Works in RF (radio-frequency) domain, not B-mode image domain
-
-### Paper Figures to Reproduce
-
-| Figure | Description | Data Required |
-|--------|-------------|---------------|
-| Fig. 7 | In-vitro phantom results with ground truth comparison | Synthetic tissue + haze |
-| Fig. 9 | PSNR vs haze level comparison | Synthetic data with varying haze |
-| Fig. 10-11 | gCNR scores grouped by subject/view | In-vivo or synthetic |
-| Fig. 14 | Qualitative dehazing comparison | Any test data |
-
-### Metrics to Implement
-
-1. **PSNR** - Peak Signal-to-Noise Ratio (for in-vitro with ground truth)
-2. **gCNR** - Generalized Contrast-to-Noise Ratio (unsupervised, for in-vivo)
-3. **KS Test** - Kolmogorov-Smirnov for speckle statistics preservation
-4. **FWHM** - Lateral speckle size (resolution metric)
-
-## Current Codebase State
-
-### Repository Structure
-```
-/scrfs/storage/tp030/home/f2f_ldm/dehazing-diffusion/
-├── joint_diffusion/           # Main codebase (originally TensorFlow)
-│   ├── generators/
-│   │   ├── layers.py          # NEEDS PORTING (TF layers)
-│   │   ├── SGM/
-│   │   │   ├── SGM.py         # NEEDS PORTING (NCSNv2, ScoreNet)
-│   │   │   ├── sde_lib.py     # NEEDS PORTING (VPSDE, VESDE, etc.)
-│   │   │   ├── sampling.py    # NEEDS PORTING (PC sampler)
-│   │   │   └── guidance.py    # NEEDS PORTING (PIGDM, DPS, Projection)
-│   ├── utils/
-│   │   ├── corruptors.py      # TF-dependent
-│   │   ├── inverse.py         # TF-dependent
-│   │   ├── signals.py         # TF-dependent
-│   │   └── utils.py           # TF-dependent
-│   └── datasets.py            # Mixed TF/PyTorch (ZeaDataset is PyTorch)
-│
-├── reproduce_helpers/
-│   ├── ncsnv2/                # OFFICIAL PyTorch NCSNv2 from Yang Song
-│   │   ├── models/
-│   │   │   ├── ncsnv2.py      # PyTorch NCSNv2 model
-│   │   │   ├── layers.py      # PyTorch layers (ResidualBlock, RefineBlock, etc.)
-│   │   │   ├── normalization.py
-│   │   │   └── __init__.py    # get_sigmas(), anneal_Langevin_dynamics()
-│   │   ├── losses/dsm.py      # anneal_dsm_score_estimation()
-│   │   ├── runners/ncsn_runner.py  # Training/sampling loop
-│   │   └── configs/           # Example configs (celeba.yml, etc.)
-│   │
-│   ├── score_sde_pytorch/     # OFFICIAL PyTorch score_sde from Yang Song
-│   │   ├── sde_lib.py         # VPSDE, VESDE, subVPSDE (PyTorch)
-│   │   ├── sampling.py        # PC sampler, predictors, correctors
-│   │   ├── losses.py          # get_sde_loss_fn, get_smld_loss_fn
-│   │   ├── models/
-│   │   │   ├── ncsnv2.py      # PyTorch NCSNv2
-│   │   │   ├── ncsnpp.py      # PyTorch NCSN++
-│   │   │   ├── layers.py      # PyTorch layers
-│   │   │   └── utils.py       # get_score_fn(), get_model_fn()
-│   │   └── configs/           # Example configs
-│   │
-│   └── sanity_test_pytorch.sh # Sanity test script
+**Virtual environment**:
+```bash
+source /scrfs/storage/tp030/home/f2f_ldm/.venv_joint/bin/activate
 ```
 
-## Reference Implementations (USE THESE)
+**Full plan**: `/home/tp030/f2f_ldm/dehazing-diffusion/paper/plan.md`
 
-### 1. Official NCSNv2 (PyTorch)
-Location: `reproduce_helpers/ncsnv2/`
-- **Author**: Yang Song (paper author)
-- **Paper**: "Improved Techniques for Training Score-Based Generative Models"
-- **Key files**:
-  - `models/ncsnv2.py`: `NCSNv2`, `NCSNv2Deeper`, `NCSNv2Deepest` nn.Modules
-  - `models/layers.py`: `ResidualBlock`, `RefineBlock`, `RCUBlock`, `MSFBlock`, `CRPBlock`
-  - `models/__init__.py`: `get_sigmas()`, `anneal_Langevin_dynamics()`
-  - `losses/dsm.py`: `anneal_dsm_score_estimation()` - the loss function
+---
 
-### 2. Official Score SDE (PyTorch)
-Location: `reproduce_helpers/score_sde_pytorch/`
-- **Author**: Yang Song (paper author)
-- **Paper**: "Score-Based Generative Modeling through Stochastic Differential Equations"
-- **Key files**:
-  - `sde_lib.py`: `VPSDE`, `VESDE`, `subVPSDE` classes with `marginal_prob()`, `prior_sampling()`, `reverse()`
-  - `sampling.py`: `EulerMaruyamaPredictor`, `ReverseDiffusionPredictor`, `LangevinCorrector`, `get_pc_sampler()`
-  - `losses.py`: `get_sde_loss_fn()`, `get_smld_loss_fn()`, `get_ddpm_loss_fn()`
-  - `models/utils.py`: `get_score_fn()` - wraps model to return proper score
+## What's Already Done (DO NOT MODIFY)
 
-## Porting Requirements
+These files were ported and pass all tests. Do not rewrite them:
 
-### 1. Keep Same Import Structure
-The user wants to keep imports like:
+| File | Status |
+|------|--------|
+| `generators/SGM/sde_lib.py` | Ported — `SDE`, `VPSDE`, `VESDE`, `subVPSDE`, `simple` |
+| `generators/layers.py` | Ported — `ConvBlock`, `ResidualBlock`, `RCUBlock`, `MSFBlock`, `CRPBlock`, `RefineBlock`, `get_activation`, `get_normalization` |
+| `generators/SGM/SGM.py` | Ported — `NCSNv2(nn.Module)`, `ScoreNet(nn.Module)` |
+| `generators/SGM/sampling.py` | Ported — `ScoreSampler`, predictors, correctors |
+| `generators/SGM/guidance.py` | Ported — `PIGDM`, `DPS`, `Projection` |
+| `utils/corruptors.py` | Ported — `GaussianCorruptor`, `CSCorruptor`, `HazeCorruptor` |
+| `generators/__init__.py` | Created |
+| `generators/SGM/__init__.py` | Created |
+| `utils/__init__.py` | Created |
+| `test_sanity.py` | Created — 6 test groups, all PASS |
+| `datasets.py` | Partially done — `ZeaDataset` class at bottom is PyTorch, but top-level imports are TF |
+
+### Key Design Decisions Already Made
+
+1. **Image format**: PyTorch `(B, C, H, W)` — channel first
+2. **NCSNv2 signature**: `model(x)` takes only `x`, NOT `(x, t)`. Time conditioning is in `ScoreNet.get_score(x, t)` which divides by `std(t)`.
+3. **Config format**: Uses attribute-style access (`config.channels`, `config.sde`). The codebase uses `easydict.EasyDict` or `wandb.config` objects.
+4. **No `get_sde()` factory**: SDE classes are used directly. If you add a factory, put it in `sde_lib.py`.
+
+---
+
+## Files That Need Porting (Priority Order)
+
+### Priority 1: Required for `train.py`
+
+#### 1. `datasets.py`
+**Current state**: Top-level imports `tensorflow`, `keras`. Bottom has PyTorch `ZeaDataset` (already working).
+**Action**: Remove TF imports. Keep `ZeaDataset` and `_get_zea_dataset()`. The TF dataset functions (`_get_mnist`, `_get_celeba`, `_get_tmnist`, `_get_sine_noise_dataset`, `_get_sine_noise1D_dataset`) can be **removed or stubbed** — they are not needed for ZEA training. The `get_dataset()` dispatcher should still work for `zea_tissue` and `zea_haze`.
+**Watch out**: `get_dataset()` currently calls `dataset.prefetch()` (TF) and checks `element_spec` (TF) for non-ZEA datasets. The ZEA path returns early before those lines, but the TF imports at the top will still fail.
+**Imports to remove**: `tensorflow`, `keras.utils.to_categorical`, `sklearn.model_selection`, `utils.signals` (TF-dependent), `utils.utils.download_and_unpack`, `utils.utils.get_normalization_layer`
+
+#### 2. `utils/utils.py`
+**Current state**: Hybrid TF+PyTorch. Imports `tensorflow as tf` and `torch`.
+**Action**: Remove all TF ops. Keep PyTorch and numpy utilities. Key functions needed downstream:
+- `load_config_from_yaml(path)` → returns easydict. Currently uses `yaml.safe_load`. **No TF dependency** in this function itself.
+- `save_dict_to_yaml(d, path)` → **No TF dependency**.
+- `set_random_seed(seed)` → sets `np.random.seed`, `random.seed`, `torch.manual_seed`. Remove `tf.random.set_seed`.
+- `check_model_library(model)` → returns `"pytorch"` if `torch.nn.Module`, else `"tensorflow"`. Remove TF branch or just always return `"pytorch"`.
+- `add_args_to_config(args, config)` → merges argparse args into config dict. **No TF dependency**.
+- `update_dict(base, update)` → recursive dict merge. **No TF dependency**.
+- `tf_expand_multiple_dims` → **DELETE**, replaced by `while std.dim() < x.dim(): std = std.unsqueeze(-1)` in ported code.
+- `tf_tensor_to_torch`, `convert_torch_tensor` → **DELETE** or simplify.
+- `get_normalization_layer` → TF `Rescaling` layer. **DELETE** (only used by TF datasets).
+- `download_and_unpack` → used for CelebA. Can keep or remove.
+- `random_augmentation` → TF augmentation. **DELETE** (not needed for ZEA).
+- `timefunc` decorator → keep (no TF).
+- `save_animation`, `save_to_gif`, `save_to_video` → use matplotlib/numpy. Check for TF refs and remove.
+- `get_latest_checkpoint` → keep (filesystem ops only).
+
+#### 3. `generators/models.py`
+**Current state**: Imports `tensorflow_addons`, `keras`, and all model classes.
+**Action**: Remove TF imports. The `get_model()` function should handle `model_name == "score"` by returning `ScoreNet(config)`. For the "score" path, it currently calls `model.compile(optimizer=..., loss_fn="score_loss")` which is a Keras pattern. Replace with just returning the model — optimizer setup moves to the training script.
+**Key change**: `get_model()` should NOT call `.compile()`. Just instantiate and return the model. The training loop handles optimizer.
+**Remove**: GAN, UNet, NCSNv2-standalone (Keras versions), encoder/decoder models. Only keep `score` path using the already-ported `ScoreNet`.
+
+#### 4. `utils/gpu_config.py`
+**Current state**: Likely calls `tf.config.experimental.set_memory_growth` etc.
+**Action**: Replace with PyTorch GPU config: `torch.cuda.set_device()`, or just make it a no-op. PyTorch handles GPU automatically.
+
+#### 5. `utils/callbacks.py`
+**Current state**: Keras `Callback` subclasses `EvalDataset` and `Monitor`.
+**Action**: Rewrite as plain Python classes that get called from the training loop (not Keras callbacks). Key functionality:
+- `EvalDataset`: computes evaluation loss periodically
+- `Monitor`: generates sample images periodically, saves plots
+Both need to work with PyTorch tensors and the ported `ScoreNet`.
+
+#### 6. `utils/checkpoints.py`
+**Current state**: Hybrid TF+PyTorch checkpointing.
+**Action**: Keep PyTorch checkpointing (`torch.save`, `torch.load`). Remove TF checkpoint code. Key interface:
+- `ModelCheckpoint.save(epoch)` → saves model state dict + optimizer state
+- `ModelCheckpoint.restore(file=None)` → loads latest or specified checkpoint
+
+#### 7. `train.py`
+**Current state**: Uses `wandb.init`, `keras.callbacks.ReduceLROnPlateau`, `wandb.keras.WandbCallback`, `model.fit()`.
+**Action**: Rewrite as a standard PyTorch training loop:
 ```python
-from generators.SGM.SGM import NCSNv2, ScoreNet
-from generators.SGM.sde_lib import VPSDE, VESDE, get_sde
-from generators.SGM.sampling import ScoreSampler, get_predictor, get_corrector
-from generators.layers import ConvBlock, ResidualBlock, RefineBlock
+for epoch in range(epochs):
+    for batch in dataloader:
+        optimizer.zero_grad()
+        loss = model.score_loss(batch)
+        loss.backward()
+        optimizer.step()
+        ema_update(...)  # if using EMA
+    # eval, checkpoint, logging
 ```
+Keep wandb logging. Keep YAML config loading. Keep argparse interface (`-c config.yaml`).
 
-### 2. PyTorch-Only
-- NO TensorFlow imports
-- NO Keras imports
-- Use `torch.nn.Module` for all models
-- Use `torch.Tensor` throughout
+### Priority 2: Required for `inference.py`
 
-### 3. Match TF Interface Where Possible
-The TF code uses configs with attributes like:
+#### 8. `utils/inverse.py`
+**Current state**: Hybrid TF+PyTorch. Contains `SGMDenoiser`, `GANDenoiser`, `GlowDenoiser`, `BM3DDenoiser`, etc.
+**Action**: Port `SGMDenoiser` to PyTorch. It's the one needed for PIGDM inference. It wraps `ScoreNet` + `ScoreSampler` + `Corruptor`. The other denoisers (GAN, Glow, BM3D, NLM) can be kept as-is or stubbed.
+**Key method**: `SGMDenoiser.__call__(noisy, clean=None)` → runs `ScoreSampler` with guidance.
+
+#### 9. `utils/runs.py`
+**Current state**: No TF imports (uses yaml, wandb, easydict, utils.utils).
+**Action**: Should work once `utils/utils.py` is ported. Verify.
+
+#### 10. `utils/signals.py`
+**Current state**: TF-only (`tensorflow`, `tensorflow_addons`).
+**Action**: Only needed by TF datasets and `GaussianCorruptor` (old TF version). The ported `GaussianCorruptor` doesn't use it. Can stub or delete. If keeping: `add_gaussian_noise(x, sigma)` is just `x + torch.randn_like(x) * sigma`.
+
+#### 11. `inference.py`
+**Current state**: Uses `easydict`, chains through `get_model`, `get_denoiser`, `init_config`, etc.
+**Action**: Once dependencies are ported, this should mostly work. May need minor adjustments.
+
+### Not Needed (Skip)
+
+- `generators/GAN.py` — TF Keras GAN, not needed for score-based dehazing
+- `generators/glow/` — Already PyTorch, not needed for this task
+- `utils/nlm.py` — Non-local means denoiser, classical method
+- `utils/metrics.py` — Check if it uses TF; if pure numpy, leave as-is
+- `utils/opt.py` — Check dependencies
+- `utils/git_info.py` — Pure Python, no changes needed
+
+---
+
+## Reference Implementations
+
+Use these as ground truth when unsure:
+
+| Location | Contents |
+|----------|----------|
+| `reproduce_helpers/ncsnv2/` | Official PyTorch NCSNv2 (Yang Song) |
+| `reproduce_helpers/ncsnv2/models/ncsnv2.py` | `NCSNv2` nn.Module |
+| `reproduce_helpers/ncsnv2/models/layers.py` | `ResidualBlock`, `RefineBlock`, etc. |
+| `reproduce_helpers/ncsnv2/models/normalization.py` | `InstanceNorm2dPlus`, etc. |
+| `reproduce_helpers/ncsnv2/losses/dsm.py` | `anneal_dsm_score_estimation()` |
+| `reproduce_helpers/ncsnv2/runners/ncsn_runner.py` | Training loop reference |
+| `reproduce_helpers/score_sde_pytorch/` | Official PyTorch score_sde (Yang Song) |
+| `reproduce_helpers/score_sde_pytorch/sde_lib.py` | `VPSDE`, `VESDE`, `subVPSDE` |
+| `reproduce_helpers/score_sde_pytorch/sampling.py` | PC sampler, predictors, correctors |
+| `reproduce_helpers/score_sde_pytorch/losses.py` | `get_sde_loss_fn()`, `get_smld_loss_fn()` |
+| `reproduce_helpers/score_sde_pytorch/models/utils.py` | `get_score_fn()` |
+
+**For training loop structure**, reference `reproduce_helpers/ncsnv2/runners/ncsn_runner.py` — it has a clean PyTorch training loop with EMA, checkpointing, and evaluation.
+
+---
+
+## Config Files (Already Created)
+
+These YAML configs exist and should be loaded by the training/inference scripts:
+
+| File | Purpose |
+|------|---------|
+| `configs/training/score_zea_tissue.yaml` | Train tissue model (100 epochs, bs=8, lr=1e-4, NCSNv2, VESDE) |
+| `configs/training/score_zea_haze.yaml` | Train haze model (same params, different dataset) |
+| `configs/inference/paper/zea_dehaze_pigdm.yaml` | PIGDM joint inference (lambda=0.5, kappa=0.5, T=200) |
+
+---
+
+## Existing Config Keys Used by Ported Code
+
+`ScoreNet(config)` expects these config attributes:
+
 ```python
-config.image_shape = (H, W, C)  # TF format
-config.channels = 128
-config.activation = 'elu'
-config.normalization = 'batch'
-config.sde = 'vesde'
-config.num_scales = 1000
+config.image_shape    # (C, H, W) e.g. (3, 1024, 64)
+config.channels       # int, base feature channels, e.g. 32
+config.activation     # str, e.g. 'elu'
+config.normalization  # str, e.g. 'instance'
+config.kernel_size    # int, e.g. 3
+config.sde            # str: 'vesde', 'vpsde', 'subvpsde', 'simple'
+config.sigma_min      # float (for VESDE)
+config.sigma_max      # float (for VESDE)
+config.beta_min       # float (for VPSDE)
+config.beta_max       # float (for VPSDE)
+config.num_scales     # int, number of discretization steps
+config.score_backbone # str, default 'NCSNv2'
+config.reduce_mean    # bool, default True
+config.likelihood_weighting  # bool, default False
 ```
 
-The PyTorch code should accept the same config format.
+`ScoreSampler(...)` expects these init args (from inference config):
 
-## Files to Port (Priority Order)
-
-### Priority 1: Core Model Components
-1. **`generators/SGM/sde_lib.py`**
-   - Port from `score_sde_pytorch/sde_lib.py`
-   - Classes: `SDE`, `VPSDE`, `VESDE`, `subVPSDE`, `simple`
-   - Keep `get_sde(config)` factory function
-
-2. **`generators/layers.py`**
-   - Port from `ncsnv2/models/layers.py` and `score_sde_pytorch/models/layers.py`
-   - Classes: `ConvBlock`, `ResidualBlock`, `RefineBlock`, `RCUBlock`, `MSFBlock`, `CRPBlock`
-   - Functions: `get_activation()`, `get_normalization()`
-
-3. **`generators/SGM/SGM.py`**
-   - Port `NCSNv2` from `ncsnv2/models/ncsnv2.py`
-   - Port `ScoreNet` training wrapper (handles SDE, loss, sampling)
-   - Ensure `model(x, t)` returns score
-
-### Priority 2: Sampling & Training
-4. **`generators/SGM/sampling.py`**
-   - Port from `score_sde_pytorch/sampling.py`
-   - Classes: `Predictor`, `Corrector`, `EulerMaruyamaPredictor`, `ReverseDiffusionPredictor`, `LangevinCorrector`
-   - Functions: `get_pc_sampler()`, `anneal_Langevin_dynamics()`
-
-5. **`generators/SGM/guidance.py`**
-   - Port guidance classes: `PIGDM`, `DPS`, `Projection`
-   - Used for conditional sampling (denoising, compressed sensing)
-
-### Priority 3: Utils & Dataset
-6. **`utils/corruptors.py`** - Port noise corruptors
-7. **`utils/inverse.py`** - Port denoising utilities
-8. **`datasets.py`** - `ZeaDataset` is already PyTorch, keep TF loaders for compatibility
-
-## Key Differences TF vs PyTorch
-
-| Aspect | TensorFlow | PyTorch |
-|--------|------------|---------|
-| Image format | (B, H, W, C) | (B, C, H, W) |
-| Model class | `keras.Model` | `nn.Module` |
-| Forward | `model(x, training=True)` | `model(x)` |
-| Gradients | `tf.GradientTape()` | `torch.autograd.grad()` |
-| Random | `tf.random.normal()` | `torch.randn()` |
-| Device | Auto | `.to(device)` required |
-
-## Sanity Test Criteria
-
-Create a test script that verifies:
-
-1. **Imports work** without TensorFlow
-   ```python
-   from generators.SGM.SGM import NCSNv2, ScoreNet
-   from generators.SGM.sde_lib import VPSDE, VESDE
-   from generators.layers import ResidualBlock, RefineBlock
-   ```
-
-2. **SDE classes work**
-   ```python
-   sde = VESDE(sigma_min=0.01, sigma_max=50, N=100)
-   x = torch.randn(2, 1, 64, 64)
-   t = torch.rand(2)
-   mean, std = sde.marginal_prob(x, t)
-   assert mean.shape == x.shape
-   ```
-
-3. **Model forward pass works**
-   ```python
-   model = NCSNv2(config)
-   x = torch.randn(2, 1, 64, 64)
-   score = model(x)
-   assert score.shape == x.shape
-   ```
-
-4. **Loss computation works**
-   ```python
-   score_net = ScoreNet(config)
-   loss = score_net.score_loss(batch)
-   loss.backward()
-   ```
-
-5. **Sampling works** (at least a few steps)
-   ```python
-   samples = score_net.sample(batch_size=2)
-   assert samples.shape == (2, C, H, W)
-   ```
-
-6. **ZeaDataset works**
-   ```python
-   dataset = ZeaDataset(root=data_path, split='train')
-   batch = next(iter(DataLoader(dataset, batch_size=4)))
-   assert isinstance(batch, torch.Tensor)
-   ```
-
-## Config Example
-
-```yaml
-# Example config for ZEA dehazing
-dataset_name: zea_haze
-data_root: /path/to/data
-image_size: [128, 64]  # H, W
-channels: 32           # Base feature channels
-in_channels: 1         # Input image channels
-
-# Model
-score_backbone: NCSNv2
-activation: elu
-normalization: instance
-kernel_size: 3
-
-# SDE
-sde: vesde
-sigma_min: 0.01
-sigma_max: 50
-num_scales: 1000
-
-# Training
-batch_size: 16
-lr: 0.0001
-n_iters: 100000
-
-# Sampling
-predictor: reverse_diffusion
-corrector: langevin
-snr: 0.16
+```python
+sampling_method   # 'pc'
+predictor         # 'euler_maruyama' or 'reverse_diffusion'
+corrector         # 'langevin', 'ald', 'none'
+corrector_snr     # float, e.g. 0.16
+guidance          # 'pigdm', 'dps', 'projection', or None
+lambda_coeff      # float, e.g. 0.5
+kappa_coeff       # float, e.g. 0.5
+noise_model       # ScoreNet instance (for joint inference) or None
 ```
 
-## Important Notes
-
-1. **Don't guess implementations** - Always reference the official PyTorch code in `ncsnv2/` and `score_sde_pytorch/`
-
-2. **Test incrementally** - After porting each file, run the sanity test to verify
-
-3. **Preserve TF config format** - The user has existing YAML configs that use TF conventions
-
-4. **ZeaDataset is special** - It's for ultrasound RF data with shape (N, n_tx, n_ax, n_el), already PyTorch
-
-5. **The guidance module** is for conditional/inverse problems (denoising, dehazing) - port carefully
+---
 
 ## Success Criteria
 
-1. ✅ All imports work without TensorFlow
-2. ✅ `python -c "from generators.SGM.SGM import NCSNv2"` succeeds
-3. ✅ Sanity test script passes all layers
-4. ✅ Can instantiate model, compute loss, run backward
-5. ✅ ZeaDataset loads and batches correctly
-6. ✅ (Bonus) Full training loop runs for a few iterations
+### Must Pass
 
-## Virtual Environment
+1. `python -c "from datasets import get_dataset"` — no TF import error
+2. `python -c "from generators.models import get_model"` — no TF import error
+3. `python -c "from utils.utils import load_config_from_yaml, set_random_seed"` — works
+4. Training runs for at least 2 steps on ZEA data without error:
+   ```bash
+   cd /scrfs/storage/tp030/home/f2f_ldm/dehazing-diffusion/joint_diffusion
+   source /scrfs/storage/tp030/home/f2f_ldm/.venv_joint/bin/activate
+   python train.py -c configs/training/score_zea_tissue.yaml --data_root ../../data
+   ```
+   (or a new `train_pytorch.py` if `train.py` is rewritten)
+5. Loss is finite (not NaN/Inf) and decreases over steps
+6. Checkpoints save and load correctly
+7. `test_sanity.py` still passes (don't break existing ported code)
 
-```bash
-source /scrfs/storage/tp030/home/f2f_ldm/.venv_joint/bin/activate
-cd /scrfs/storage/tp030/home/f2f_ldm/dehazing-diffusion/joint_diffusion
-```
+### Bonus
 
-Packages needed: `torch`, `numpy`, `tqdm`, `pyyaml`
+8. `inference.py` runs PIGDM dehazing with two trained models
+9. wandb logging works (offline mode)
+10. EMA (exponential moving average) of model weights during training
 
 ---
 
-## Paper Reproduction Plan
+## Important Constraints
 
-The full reproduction plan is in `/home/tp030/f2f_ldm/dehazing-diffusion/paper/plan.md`. Here's the summary:
+- **DO NOT install TensorFlow**. The entire point is to run without it.
+- **DO NOT modify the 6 already-ported SGM files** unless fixing a bug discovered during integration.
+- **Keep the same import paths**: `from generators.SGM.SGM import ScoreNet`, `from generators.layers import ResidualBlock`, etc.
+- **Packages available**: `torch`, `numpy`, `tqdm`, `pyyaml`, `easydict`, `wandb`, `matplotlib`, `scipy`. Check with `pip list`.
+- **No `tensorflow_addons`** — this was used for `InstanceNormalization`, `GroupNormalization`, `SpectralNormalization`, `MovingAverage` optimizer. PyTorch equivalents: `nn.InstanceNorm2d`, `nn.GroupNorm`, `torch.nn.utils.spectral_norm`, custom EMA.
 
-### Phase 1: Environment Setup ✅
-- ZEA environment: `.venv_zea` with JAX backend
-- Joint diffusion environment: `.venv_joint` with PyTorch
+---
 
-### Phase 2: Code Porting (THIS TASK)
-Port TF → PyTorch:
-- `generators/layers.py`
-- `generators/SGM/SGM.py` (NCSNv2, ScoreNet)
-- `generators/SGM/sde_lib.py` (VPSDE, VESDE)
-- `generators/SGM/sampling.py` (PC sampler)
-- `generators/SGM/guidance.py` (PIGDM, DPS, Projection)
-- `utils/corruptors.py` (HazeCorruptor)
+## EMA Reference
 
-### Phase 3: Sanity Tests
-Run incremental tests after each file is ported:
-1. Import smoke test
-2. Component shape tests
-3. Dataset loading
-4. Training smoke test (2 steps)
-5. Corruptor test
-
-### Phase 4: Data Synthesis with ZEA
-```bash
-cd /home/tp030/f2f_ldm
-source .venv_zea/bin/activate
-KERAS_BACKEND=jax python dehazing-diffusion/reproduce_helpers/zea_synthesize_dataset.py \
-  --output-root data/zea_synth \
-  --n-train 1000 --n-val 100
-```
-
-Output structure:
-```
-data/zea_synth/
-├── tissue/
-│   ├── train.npz  # shape: (N, n_tx, n_ax, n_el)
-│   └── val.npz
-└── haze/
-    ├── train.npz
-    └── val.npz
-```
-
-### Phase 5: Train Diffusion Models
-
-**Tissue model** (clean ultrasound prior):
-```bash
-python train.py -c configs/training/score_zea_tissue.yaml --data_root ../../data
-```
-
-**Haze model** (haze prior):
-```bash
-python train.py -c configs/training/score_zea_haze.yaml --data_root ../../data
-```
-
-Training parameters (from paper Section 3.2.4):
-- Batch size: 8
-- Learning rate: 1e-4
-- Epochs: 100
-- Network: NCSNv2 (channels=32, kernel=3)
-- Image size: [1024, 64] or configured
-
-### Phase 6: Joint Inference (Dehazing)
-
-**Inference config**: `configs/inference/paper/zea_dehaze_pigdm.yaml`
-
-Key parameters:
-- `guidance: pigdm` (Pseudo-Inverse Guidance)
-- `lambda_coeff: 0.5` (tissue data consistency weight)
-- `kappa_coeff: 0.5` (haze data consistency weight)
-- `num_scales: 200` (T=200 diffusion steps)
-
-```bash
-python inference.py -e paper/zea_dehaze_pigdm -t denoise -m sgm --data_root ../../data
-```
-
-### Phase 7: Evaluation
-
-Compute metrics from `processing.py`:
+The original `train.py` used `tfa.optimizers.MovingAverage`. In PyTorch, EMA is typically done manually:
 
 ```python
-from processing import gcnr, psnr
-
-# gCNR: Generalized Contrast-to-Noise Ratio
-# Requires two ROIs: chamber (hazy region) and wall (tissue region)
-score = gcnr(chamber_roi, wall_roi)
-
-# PSNR: Peak Signal-to-Noise Ratio (when ground truth available)
-score = psnr(dehazed, ground_truth)
+# After each optimizer step:
+for ema_param, param in zip(ema_model.parameters(), model.parameters()):
+    ema_param.data.mul_(decay).add_(param.data, alpha=1 - decay)
 ```
+
+Or use `torch.optim.swa_utils.AveragedModel` (PyTorch 1.8+).
+
+Reference: `reproduce_helpers/ncsnv2/models/ema.py` has an `EMAHelper` class.
 
 ---
 
-## Key Files for Paper Reproduction
+## File-by-File Porting Checklist
 
-### Configs
-| File | Purpose |
-|------|---------|
-| `configs/training/score_zea_tissue.yaml` | Train tissue model |
-| `configs/training/score_zea_haze.yaml` | Train haze model |
-| `configs/inference/paper/zea_dehaze_pigdm.yaml` | Joint dehazing inference |
-
-### Scripts
-| File | Purpose |
-|------|---------|
-| `reproduce_helpers/zea_synthesize_dataset.py` | Generate synthetic data |
-| `reproduce_helpers/visualize_dataset.py` | Visualize tissue vs haze |
-| `reproduce_helpers/visualize_cyst.py` | Visualize cyst phantom |
-| `joint_diffusion/train.py` | Train diffusion models |
-| `joint_diffusion/inference.py` | Run dehazing inference |
-
-### SLURM Scripts
-| File | Purpose |
-|------|---------|
-| `reproduce_helpers/slurm_zea_synth.sh` | Data synthesis job |
-| `reproduce_helpers/slurm_sanity_test.sh` | Sanity test job |
-
----
-
-## Algorithm: Joint Posterior Sampling (PIGDM)
-
-From the paper (Algorithm 1):
-
-```
-Input: measurement y, models s_θ (tissue), s_φ (haze)
-Output: dehazed x_0, haze estimate h_0
-
-1. Initialize x_T ~ N(0, σ_max²I), h_T ~ N(0, σ_max²I)
-2. for t = T, T-1, ..., 1 do:
-   # Predictor step (reverse diffusion)
-   3. x_{t-1} = x_t + s_θ(x_t, t) * step_size + noise
-   4. h_{t-1} = h_t + s_φ(h_t, t) * step_size + noise
-   
-   # Corrector step (Langevin dynamics)
-   5. x_{t-1} = x_{t-1} + s_θ(x_{t-1}, t) * step_size + noise
-   6. h_{t-1} = h_{t-1} + s_φ(h_{t-1}, t) * step_size + noise
-   
-   # Data consistency step (PIGDM guidance)
-   7. r_t² = σ_t² / (σ_t² + 1)
-   8. Σ_t = r_t² * I + r_t² * I  # Joint covariance
-   9. μ_t = x_{0|t} + h_{0|t}     # Joint mean (Tweedie estimates)
-   10. ∇_x log p(y|x_t,h_t) = Σ_t⁻¹(y - μ_t) * ∂x_{0|t}/∂x_t
-   11. ∇_h log p(y|x_t,h_t) = Σ_t⁻¹(y - μ_t) * ∂h_{0|t}/∂h_t
-   12. x_{t-1} = x_{t-1} + λ * r_t² * ∇_x log p(y|x_t,h_t)
-   13. h_{t-1} = h_{t-1} + κ * r_t² * ∇_h log p(y|x_t,h_t)
-   
-3. return x_0, h_0
-```
-
-This is implemented in `generators/SGM/guidance.py` class `PIGDM`.
-
----
-
-## Troubleshooting
-
-### TensorFlow Import Errors
-The goal is to eliminate ALL TensorFlow imports. If you see:
-```
-ModuleNotFoundError: No module named 'tensorflow'
-```
-Find the file with TF imports and port it to PyTorch.
-
-### Shape Mismatches
-- TensorFlow: `(B, H, W, C)` - channels last
-- PyTorch: `(B, C, H, W)` - channels first
-- ZEA data: `(N, n_tx, n_ax, n_el)` = `(N, C, H, W)` already PyTorch format
-
-### GPU OOM
-- Reduce batch size
-- Use gradient checkpointing
-- For ZEA: `XLA_PYTHON_CLIENT_MEM_FRACTION=0.95`
-
-### NaN in Training
-- Check data normalization (should be in `image_range`, typically [0,1] or [-1,1])
-- Reduce learning rate
-- Check SDE sigma values
-
----
-
-## Expected Outputs for Paper Figures
-
-### Figure 7: In-Vitro Comparison
-Generate with synthetic data:
-- Ground truth tissue `x`
-- Ground truth haze `h`
-- Measurement `y = x + h`
-- Dehazed output `x̂`
-- Haze estimate `ĥ`
-- Error maps `|x - x̂|`
-
-### Figure 9: PSNR vs Haze Level
-Test at different haze strengths:
-```python
-for gamma in [0.1, 0.2, 0.3, 0.4, 0.5]:
-    y = x + gamma * h
-    x_hat = dehaze(y)
-    psnr_score = psnr(x_hat, x)
-```
-
-### Figure 10-11: gCNR Box Plots
-Compute gCNR for each frame:
-```python
-for frame in dataset:
-    score = gcnr(frame, chamber_mask, wall_mask)
-```
-Group by subject (Fig 10) or view (Fig 11).
-
-### Figure 14: Qualitative Results
-Show B-mode images:
-- Original hazy `y`
-- Dehazed `x̂`
-- Haze estimate `ĥ`
-- Compare: Diffusion vs NCSNv2 supervised vs BM3D
-
----
-
-## Checklist: Full Paper Reproduction with sanity test
-
-### Code Porting
-- [ ] `generators/layers.py` - PyTorch layers
-- [ ] `generators/SGM/sde_lib.py` - SDE classes
-- [ ] `generators/SGM/SGM.py` - NCSNv2, ScoreNet
-- [ ] `generators/SGM/sampling.py` - PC sampler
-- [ ] `generators/SGM/guidance.py` - PIGDM, DPS, Projection
-- [ ] `utils/corruptors.py` - HazeCorruptor
-- [ ] `datasets.py` - ZeaDataset (already done)
-
-### Sanity Tests
-- [ ] All imports work without TensorFlow
-- [ ] SDE marginal_prob shapes correct
-- [ ] NCSNv2 forward pass works
-- [ ] Loss computation and backward work
-- [ ] ZeaDataset loads correctly
-
-### Data & Training
-- [ ] Generate synthetic tissue data with ZEA
-- [ ] Generate synthetic haze data with ZEA
-- [ ] Train tissue diffusion model
-- [ ] Train haze diffusion model
-- [ ] Validate models on held-out data
-
-### Inference & Evaluation
-- [ ] Run PIGDM joint inference
-- [ ] Compute PSNR (synthetic data)
-- [ ] Compute gCNR
-- [ ] Generate comparison figures
-- [ ] Compare with baselines (BM3D, supervised NCSNv2)
+- [ ] `utils/utils.py` — Remove TF, keep PyTorch + numpy utilities
+- [ ] `utils/gpu_config.py` — Replace TF GPU config with PyTorch or no-op
+- [ ] `utils/signals.py` — Stub or delete (not needed for ZEA)
+- [ ] `datasets.py` — Remove TF imports, keep ZeaDataset path working
+- [ ] `generators/models.py` — Remove TF, keep `get_model()` for "score" path only
+- [ ] `utils/checkpoints.py` — Remove TF checkpointing, keep PyTorch
+- [ ] `utils/callbacks.py` — Rewrite as plain Python classes (not Keras Callbacks)
+- [ ] `train.py` — Rewrite with PyTorch training loop
+- [ ] `utils/inverse.py` — Port `SGMDenoiser` for inference
+- [ ] `inference.py` — Adjust after dependencies are ported
+- [ ] Verify `test_sanity.py` still passes
+- [ ] Run training smoke test (2 steps on ZEA data)
