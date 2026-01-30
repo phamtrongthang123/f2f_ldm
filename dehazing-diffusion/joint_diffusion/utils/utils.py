@@ -1,5 +1,6 @@
 """Utilities
 Author(s): Tristan Stevens
+Ported to PyTorch: Jan 2026
 """
 import datetime
 import functools
@@ -15,7 +16,6 @@ import gdown
 import matplotlib.pyplot as plt
 import numpy as np
 import requests
-import tensorflow as tf
 import torch
 import tqdm
 import yaml
@@ -59,44 +59,40 @@ def tqdm_progress_bar(total, *args, **kwargs):
 
 def set_random_seed(seed=None):
     """Set random seed to all random generators."""
+    if seed is None:
+        return None
     np.random.seed(seed)
-    tf.random.set_seed(seed)
     random.seed(seed)
-    cvxopt.setseed(seed)
-    torch.random.manual_seed(0)
+    try:
+        cvxopt.setseed(seed)
+    except Exception:
+        pass  # cvxopt may not always be available
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     return seed
 
 
-def get_normalization_layer(a, b, x_min=0, x_max=255):
-    """Normalization layer.
-
-    Args:
-        a (float): minimum value of range to map to.
-        b (float): maximum value of range to map to.
-        x_min (float, optional): min value of input image. Defaults to 0.
-        x_max (float, optional): max value of input image. Defaults to 255.
-
-    Returns:
-        tf layer: tensorflow Rescaling layer.
-
-    """
-    scale = (b - a) / (x_max - x_min)
-    offset = a
-    return tf.keras.layers.Rescaling(scale=scale, offset=offset)
-
-
 def tensor_to_images(x, x_min=-1, x_max=1, a=0, b=255):
-    """Convert / quantize tensors to image values (uint32)."""
+    """Convert / quantize tensors to image values (uint8).
+    
+    Works with numpy arrays, PyTorch tensors.
+    """
+    if isinstance(x, torch.Tensor):
+        x = x.detach().cpu().numpy()
     x = np.clip(x, x_min, x_max)
     scale = (x_max - x_min) / (b - a)
     offset = x_min
     image = (x - offset) / scale
-    return tf.cast(image, dtype=tf.uint32)
+    return image.astype(np.uint8)
 
 
 def images_to_tensor(x, a, b, x_min=0, x_max=255):
     """Convert / dequantize images to tensors."""
-    image = tf.cast(x, dtype=tf.float32)
+    if isinstance(x, torch.Tensor):
+        image = x.float()
+    else:
+        image = np.array(x, dtype=np.float32)
     scale = (b - a) / (x_max - x_min)
     offset = a
     image = image * scale + offset
@@ -248,13 +244,6 @@ def plot_image_grid(
     return fig
 
 
-def get_custom_image(path, config):
-    """Open a custom image from path."""
-    image = Image.open(Path(path)).resize((config.image_size, config.image_size))
-    image = tf.expand_dims(image, axis=0)
-    image = images_to_tensor(image, *config.image_range)
-
-
 def load_config_from_yaml(path, wandb_file=False):
     """Load configuration file from yaml into dictionary."""
     with open(Path(path)) as file:
@@ -263,14 +252,14 @@ def load_config_from_yaml(path, wandb_file=False):
         if wandb_file:
             new_dictionary = {}
             for key, value in dictionary.items():
-                if "value" in value:
+                if isinstance(value, dict) and "value" in value:
                     new_dictionary[key] = value["value"]
                 else:
                     new_dictionary[key] = value
             dictionary = new_dictionary
         return edict(dictionary)
     else:
-        return {}
+        return edict({})
 
 
 def save_dict_to_yaml(dictionary, path):
@@ -287,7 +276,7 @@ def update_dict(dictionary: dict, update: dict):
 
 
 def make_unique_path(save_dir):
-    """Create unique directory from save_dir ussing incremental suffix."""
+    """Create unique directory from save_dir using incremental suffix."""
     save_dir = Path(save_dir)
     try:
         save_dir.mkdir(exist_ok=False, parents=True)
@@ -365,33 +354,18 @@ def translate(array, range_from, range_to):
     return rightMin + (valueScaled * (rightMax - rightMin))
 
 
-def tf_tensor_to_torch(tf_tensor, device="cuda"):
-    """Convert tensorflow tensor to torch tensor."""
-    if len(tf_tensor.shape) == 4:
-        tf_tensor = np.transpose(tf_tensor, (0, 3, 1, 2))
-    torch_tensor = np.copy(tf_tensor)
-    return torch.from_numpy(torch_tensor).to(device=device)
-
-
-def convert_torch_tensor(torch_tensor, to="numpy"):
-    """Convert torch tensor to numpy or tensorflow tensor"""
-    assert to in ["numpy", "tensorflow"]
-    numpy_array = torch_tensor.detach().cpu().numpy().transpose(0, 2, 3, 1)
-    if to == "numpy":
-        return numpy_array
-    else:
-        return tf.convert_to_tensor(numpy_array)
-
-
 def check_model_library(model):
-    """Check whether a model is a pytorch or tensorflow model."""
+    """Check whether a model is a PyTorch model.
+    
+    Returns 'pytorch' for torch.nn.Module, raises for unknown types.
+    """
     if isinstance(model, torch.nn.Module):
-        model_library = "torch"
-    elif isinstance(model, tf.keras.Model):
-        model_library = "tensorflow"
+        return "pytorch"
     else:
-        raise NotImplementedError("unknown model library")
-    return model_library
+        raise NotImplementedError(
+            f"Unknown model library for type {type(model)}. "
+            "Only PyTorch (torch.nn.Module) is supported."
+        )
 
 
 def get_latest_checkpoint(checkpoint_dir: str, extension: str, split=None):
@@ -421,49 +395,6 @@ def get_latest_checkpoint(checkpoint_dir: str, extension: str, split=None):
         return None
 
     return files[-1]
-
-
-def tf_expand_multiple_dims(tensor, n):
-    """Add multiple (`n`) singleton dimensions to a tensor."""
-    shape = tf.shape(tensor)
-    return tf.reshape(tensor, tf.concat([shape, [1] * n], axis=0))
-
-
-def random_augmentation(config: dict):
-    """Random tensorflow augmentation operations.
-
-    Function can be mapped to tensorflow dataset as follows:
-    dataset = dataset.map(random_augmentation(config))
-
-    config dictionary can contain `fliplr`, `flipud` and `brightness`.
-
-    """
-    transforms = []
-    aug_cfg = config.augmentation
-
-    # Random flip left right
-    if aug_cfg["fliplr"]:
-        transforms.append(tf.image.random_flip_left_right)
-    # Random flip up down
-    if aug_cfg["flipud"]:
-        transforms.append(tf.image.random_flip_up_down)
-    # Random brightness level
-    if aug_cfg["brightness"]:
-
-        def brightness(x):
-            x = tf.image.random_brightness(x, max_delta=aug_cfg["brightness"])
-            x = tf.clip_by_value(x, *config.image_range)
-            return x
-
-        transforms.append(brightness)
-
-    # Stack all augmentations into a single function
-    def _random_augmentation(image):
-        for transform in transforms:
-            image = transform(image)
-        return image
-
-    return _random_augmentation
 
 
 def add_args_to_config(args, config, verbose=False):
@@ -545,3 +476,40 @@ def convert_to_integers(lst: str) -> list:
         return [int(x) for x in lst[0].split()]
     except:
         return lst
+
+
+# ===== PyTorch tensor conversion utilities =====
+
+def torch_to_numpy(tensor, to_channels_last=True):
+    """Convert PyTorch tensor to numpy array.
+    
+    Args:
+        tensor: PyTorch tensor in (B, C, H, W) format
+        to_channels_last: If True, convert to (B, H, W, C) format
+    
+    Returns:
+        numpy array
+    """
+    arr = tensor.detach().cpu().numpy()
+    if to_channels_last and len(arr.shape) == 4:
+        arr = arr.transpose(0, 2, 3, 1)
+    return arr
+
+
+def numpy_to_torch(array, device="cuda", to_channels_first=True):
+    """Convert numpy array to PyTorch tensor.
+    
+    Args:
+        array: numpy array, optionally in (B, H, W, C) format
+        device: target device
+        to_channels_first: If True and array is 4D, convert from (B, H, W, C) to (B, C, H, W)
+    
+    Returns:
+        PyTorch tensor
+    """
+    if to_channels_first and len(array.shape) == 4:
+        array = np.transpose(array, (0, 3, 1, 2))
+    tensor = torch.from_numpy(np.ascontiguousarray(array))
+    if device and torch.cuda.is_available():
+        tensor = tensor.to(device=device)
+    return tensor

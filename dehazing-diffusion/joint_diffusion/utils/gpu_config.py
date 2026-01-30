@@ -1,127 +1,157 @@
-"""GPU utilities
+"""GPU utilities (PyTorch version)
 Author(s): Tristan Stevens, Ben Luijten
+Ported to PyTorch: Jan 2026
 """
 import os
-
-# set TF logging level here, any out of {"0", "1", "2"}
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-# set visible GPUs here in quotes comma separated. e.g. "0,1,2"
-# os.environ['CUDA_VISIBLE_DEVICES'] = "0, 1"
 import subprocess as sp
 import warnings
 
 import numpy as np
-import pandas as pd
-import tensorflow as tf
+import torch
 
 
 def get_gpu_memory(verbose=True):
     """Retrieve memory allocation information of all gpus.
     Arguments
         verbose: prints output if True.
-    Retuns
+    Returns
         memory_free_values: list of available memory for each gpu in MiB.
     """
     _output_to_list = lambda x: x.decode("ascii").split("\n")[:-1]
 
-    COMMAND = "nvidia-smi --query-gpu=memory.free --format=csv"
-    memory_free_info = _output_to_list(sp.check_output(COMMAND.split()))[1:]
-    memory_free_values = [int(x.split()[0]) for i, x in enumerate(memory_free_info)]
+    try:
+        COMMAND = "nvidia-smi --query-gpu=memory.free --format=csv"
+        memory_free_info = _output_to_list(sp.check_output(COMMAND.split()))[1:]
+        memory_free_values = [int(x.split()[0]) for i, x in enumerate(memory_free_info)]
+    except (FileNotFoundError, sp.CalledProcessError):
+        if verbose:
+            print("nvidia-smi not found, cannot query GPU memory")
+        return []
 
     # only show enabled devices
     if "CUDA_VISIBLE_DEVICES" in os.environ:
         gpus = os.environ["CUDA_VISIBLE_DEVICES"]
-        gpus = [int(gpu) for gpu in gpus.split(",")][: len(memory_free_values)]
-        print(
-            f"{len(memory_free_values) - len(gpus)}/{len(memory_free_values)} "
-            "GPUs were disabled"
-        )
-        memory_free_values = [memory_free_values[gpu] for gpu in gpus]
+        gpus = [int(gpu.strip()) for gpu in gpus.split(",") if gpu.strip()]
+        if verbose and len(gpus) < len(memory_free_values):
+            print(
+                f"{len(memory_free_values) - len(gpus)}/{len(memory_free_values)} "
+                "GPUs were disabled via CUDA_VISIBLE_DEVICES"
+            )
+        memory_free_values = [
+            memory_free_values[gpu] for gpu in gpus if gpu < len(memory_free_values)
+        ]
 
-    if verbose:
-        df = df = pd.DataFrame({"memory": memory_free_values})
-        df.index.name = "GPU"
-        print(df)
+    if verbose and memory_free_values:
+        print("GPU Memory Available (MiB):")
+        for i, mem in enumerate(memory_free_values):
+            print(f"  GPU {i}: {mem} MiB")
     return memory_free_values
 
 
 def set_gpu_usage(device=None):
-    """Select gpu based on gpu_ids argument.
+    """Select GPU device for PyTorch.
+    
     Args:
-        device (str/int/list): gpu number to select. If None, choose gpu based on
-            available memory. Can also be a list of integers to select
-            multiple gpus. If device is set to: `cpu`, gpu is disabled.
+        device (str/int/list): GPU number to select. 
+            - If None, choose GPU with most available memory.
+            - If 'cpu', use CPU only.
+            - If int, use that specific GPU.
+            - If list of ints, sets CUDA_VISIBLE_DEVICES (PyTorch will use first).
+    
+    Returns:
+        Selected device string (e.g., 'cuda:0' or 'cpu')
     """
     if device == "cpu":
         print("Setting device to CPU based on config.")
-        tf.config.set_visible_devices([], "GPU")
-        return
+        return "cpu"
 
-    if isinstance(device, int) or device is None:
-        gpu_ids = [device]
-    elif isinstance(device, list):
-        gpu_ids = device
+    if not torch.cuda.is_available():
+        print("CUDA not available, using CPU")
+        return "cpu"
+
+    n_gpus = torch.cuda.device_count()
+    if n_gpus == 0:
+        print("No GPUs available, using CPU")
+        return "cpu"
+
+    print(f"{n_gpus} GPU(s) available via PyTorch")
+
+    # If device is None, auto-select based on memory
+    if device is None:
+        mem = get_gpu_memory(verbose=False)
+        if mem:
+            device = int(np.argmax(mem))
+            print(f"Auto-selected GPU {device} with {mem[device]} MiB free")
+        else:
+            device = 0
+            print(f"Using default GPU {device}")
+
+    # Handle list of devices
+    if isinstance(device, list):
+        if len(device) > 0:
+            device = device[0]
+            print(f"Using first GPU from list: {device}")
+        else:
+            device = 0
+
+    # Validate device index
+    if isinstance(device, int):
+        if device >= n_gpus:
+            warnings.warn(
+                f"Requested GPU {device} but only {n_gpus} available. Using GPU 0."
+            )
+            device = 0
+        torch.cuda.set_device(device)
+        device_name = torch.cuda.get_device_name(device)
+        print(f"Selected GPU {device}: {device_name}")
+        return f"cuda:{device}"
+
+    # If device is already a string like 'cuda:0'
+    if isinstance(device, str) and device.startswith("cuda"):
+        return device
+
+    return f"cuda:{device}"
+
+
+def get_device(config=None):
+    """Get the appropriate device for PyTorch operations.
+    
+    Args:
+        config: Optional config object with 'device' attribute.
+    
+    Returns:
+        torch.device object
+    """
+    if config is not None and hasattr(config, "device"):
+        device_str = config.device
     else:
-        raise ValueError("gpu_ids must be a list or int or `cpu`.")
+        device_str = None
 
-    gpus = tf.config.experimental.list_physical_devices("GPU")
+    if device_str == "cpu":
+        return torch.device("cpu")
 
-    if not gpus:
-        print("No available GPUs...")
-        return
-    # some gpus may have been disabled with the CUDA_VISIBLE_DEVICES
-    # environment variable
-    available_gpu_ids = [int(gpu.name[-1]) for gpu in gpus]
-    print(f"{len(available_gpu_ids)} Available GPU(s): {available_gpu_ids}")
-
-    assert len(gpu_ids) <= len(
-        available_gpu_ids
-    ), "Number of selected gpus cannot be greater than the amount of available gpus"
-
-    mem = get_gpu_memory()
-
-    assert len(mem) == len(available_gpu_ids), (
-        "Some GPUs are not seen by Tensorflow (probably ones with too little tensor cores).\n"
-        "Please disable them with CUDA_VISIBLE_DEVICES at the top of this script."
-    )
-
-    if None in gpu_ids:
-        sorted_gpu_ids = np.argsort(mem)[::-1]
-
-        for i, gpu in zip(range(len(gpu_ids)), sorted_gpu_ids):
-            if gpu in available_gpu_ids:
-                gpu_ids[i] = int(gpu)
-
-        print("GPU will be automatically chosen based on available memory")
+    if torch.cuda.is_available():
+        if device_str is None:
+            return torch.device("cuda")
+        elif isinstance(device_str, int):
+            return torch.device(f"cuda:{device_str}")
+        elif isinstance(device_str, str) and device_str.startswith("cuda"):
+            return torch.device(device_str)
+        else:
+            return torch.device("cuda")
     else:
-        bad_gpu = set(gpu_ids) - set(available_gpu_ids)
-        if bad_gpu:
-            raise ValueError(f"GPU {bad_gpu} not available!!")
-
-    for gpu_id in gpu_ids:
-        print(
-            f"Selected GPU {gpus[gpu_id].name} with {mem[gpu_id]} MiB of memory available"
-        )
-
-    tf.config.experimental.set_visible_devices(
-        [gpus[gpu_id] for gpu_id in gpu_ids],
-        "GPU",
-    )
-
-    try:
-        # Currently, memory growth needs to be the same across GPUs
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-    except RuntimeError as e:
-        warnings.warn(
-            "Please use set_gpu_usage before using and Tensorflow functionality."
-        )
-        print(e)
-
-    return gpu_ids
+        return torch.device("cpu")
 
 
 if __name__ == "__main__":
-    ## Initilialize GPU
     ## Example on how to use gpu config functions
-    set_gpu_usage()
+    print("=" * 50)
+    print("GPU Configuration Test")
+    print("=" * 50)
+    device = set_gpu_usage()
+    print(f"\nFinal device: {device}")
+    
+    # Test tensor creation on selected device
+    if device != "cpu":
+        x = torch.randn(10, 10, device=device)
+        print(f"Test tensor created on: {x.device}")

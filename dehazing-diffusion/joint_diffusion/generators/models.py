@@ -1,18 +1,12 @@
-"""Load and save deep learning models
+"""Load and save deep learning models (PyTorch version)
 Author(s): Tristan Stevens
-"""
-import numpy as np
-import tensorflow_addons as tfa
-import torch
-from keras.losses import BinaryCrossentropy
-from keras.optimizers import Adam
+Ported to PyTorch: Jan 2026
 
-from generators.GAN import GAN
-from generators.glow.glow import Glow
-from generators.layers import (UNet, get_decoder_model,
-                               get_discriminator_model, get_encoder_model,
-                               get_generator_model)
-from generators.SGM.SGM import NCSNv2, ScoreNet
+Note: Only 'score' (ScoreNet) and 'glow' models are supported.
+Legacy TF models (GAN, NCSNv2-Keras, UNet-Keras) have been removed.
+"""
+import torch
+from generators.SGM.SGM import ScoreNet
 
 
 def get_model(config, run_eagerly=False, plot_summary=False, training=True):
@@ -21,77 +15,36 @@ def get_model(config, run_eagerly=False, plot_summary=False, training=True):
     Args:
         config (dict): dict object with model init parameters.
             requires different keys for different models.
-        run_eagerly (bool, optional): whether to compile model in eager mode or graph mode.
-            Defaults to False (i.e. graph mode).
-        plot_summary (bool, optional): plot summary of model. Defaults to False.
-        training (bool, optional): trainig mode, used to compile model with optimizer
-            and set loss function. Defaults to True. If False, inference mode without optimizer.
+        run_eagerly (bool, optional): Not used in PyTorch. Kept for API compatibility.
+        plot_summary (bool, optional): If True, print model summary. Defaults to False.
+        training (bool, optional): Training mode flag. Defaults to True.
 
     Returns:
-        model: ML model (TF / torch depending on which model)
+        model: PyTorch model (nn.Module)
     """
-    if run_eagerly:
-        print("Warning, run_eagerly is turned to on!!")
-
     model_name = config.model_name
 
-    assert model_name.lower() in [
-        "gan",
-        "score",
-        "glow",
-        "ncsnv2",
-        "unet",
-    ], """Invalid model name found in config file. Should
-        be either 'gan', 'score', 'glow', 'ncsnv2' or 'unet'."""
+    supported_models = ["score", "glow"]
+    assert model_name.lower() in supported_models, (
+        f"Invalid model name '{model_name}' found in config file. "
+        f"Supported models: {supported_models}"
+    )
 
     print(f"\nLoading {model_name} model...")
 
-    if model_name.lower() == "gan":
-        discriminator = get_discriminator_model(config)
-        generator = get_generator_model(config)
-
-        model = GAN(
-            discriminator=discriminator,
-            generator=generator,
-            discriminator_extra_steps=config.d_steps,
-            latent_dim=config.latent_dim,
-            label_sigma=config.label_sigma,
-        )
-
-        if plot_summary:
-            model.summary()
-
-        if training:
-            beta_1, beta_2 = config.get("adam_betas", [0.9, 0.999])
-            compile_args = {
-                "run_eagerly": run_eagerly,
-                "d_optimizer": Adam(
-                    learning_rate=config.d_lr, beta_1=beta_1, beta_2=beta_2
-                ),
-                "g_optimizer": Adam(
-                    learning_rate=config.g_lr, beta_1=beta_1, beta_2=beta_2
-                ),
-                "loss_fn": BinaryCrossentropy(from_logits=True),
-            }
-
     if model_name.lower() == "score":
         model = ScoreNet(config)
-
-        if training:
-            optimizer = Adam(learning_rate=config.lr)
-            if config.get("ema") is not None:
-                print(f"Using EMA: {config.ema}")
-                optimizer = tfa.optimizers.MovingAverage(
-                    optimizer=optimizer,
-                    average_decay=config.ema,
-                )
-            compile_args = {
-                "run_eagerly": run_eagerly,
-                "optimizer": optimizer,
-                "loss_fn": "score_loss",
-            }
+        
+        if plot_summary:
+            _print_model_summary(model, config)
+        
+        return model
 
     if model_name.lower() == "glow":
+        # Glow is already PyTorch
+        from generators.glow.glow import Glow
+        import numpy as np
+        
         model = Glow(
             np.array(config.image_shape)[[2, 0, 1]],
             K=config.K,
@@ -101,39 +54,88 @@ def get_model(config, run_eagerly=False, plot_summary=False, training=True):
             nn_init_last_zeros=config.last_zeros,
             device=config.device,
         )
+        
+        return model
 
-        if training:
-            optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
-            compile_args = {
-                "run_eagerly": run_eagerly,
-                "optimizer": optimizer,
-                "config": config,
-                "loss_fn": "nll",
-            }
+    raise ValueError(f"Model {model_name} not implemented")
 
-    if model_name.lower() == "ncsnv2":
-        model = NCSNv2(config, name="ncsnv2")
 
-        if training:
-            compile_args = {
-                "run_eagerly": run_eagerly,
-                "loss": config.loss,
-                "optimizer": Adam(learning_rate=config.lr),
-            }
+def _print_model_summary(model, config):
+    """Print a summary of the model architecture."""
+    n_params = sum(p.numel() for p in model.parameters())
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    print(f"\n{'='*60}")
+    print(f"Model: {model.__class__.__name__}")
+    print(f"{'='*60}")
+    print(f"  Input shape: {config.image_shape}")
+    print(f"  Total parameters: {n_params:,}")
+    print(f"  Trainable parameters: {n_trainable:,}")
+    print(f"  SDE: {config.get('sde', 'N/A')}")
+    print(f"  Backbone: {config.get('score_backbone', 'NCSNv2')}")
+    print(f"{'='*60}\n")
 
-    if model_name.lower() == "unet":
-        model = UNet(config, name="unet")
 
-        if training:
-            compile_args = {
-                "run_eagerly": run_eagerly,
-                "loss": config.loss,
-                "optimizer": Adam(learning_rate=config.lr),
-            }
+def create_optimizer(model, config):
+    """Create optimizer for model based on config.
+    
+    Args:
+        model: PyTorch model
+        config: Config with lr, ema, etc.
+    
+    Returns:
+        optimizer: PyTorch optimizer
+    """
+    lr = config.get("lr", 1e-4)
+    betas = config.get("adam_betas", (0.9, 0.999))
+    weight_decay = config.get("weight_decay", 0.0)
+    
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=lr,
+        betas=tuple(betas),
+        weight_decay=weight_decay,
+    )
+    
+    return optimizer
 
-    if not training:
-        model.compile(run_eagerly=run_eagerly)
-    else:
-        model.compile(**compile_args)
 
-    return model
+def create_lr_scheduler(optimizer, config):
+    """Create learning rate scheduler based on config.
+    
+    Args:
+        optimizer: PyTorch optimizer
+        config: Config with scheduler params
+    
+    Returns:
+        scheduler or None
+    """
+    scheduler_type = config.get("lr_scheduler", None)
+    
+    if scheduler_type is None:
+        return None
+    
+    if scheduler_type == "reduce_on_plateau":
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=config.get("lr_factor", 0.3),
+            patience=config.get("lr_patience", 10),
+            verbose=True,
+        )
+    
+    if scheduler_type == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=config.get("epochs", 100),
+            eta_min=config.get("lr_min", 1e-6),
+        )
+    
+    if scheduler_type == "step":
+        return torch.optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=config.get("lr_step_size", 30),
+            gamma=config.get("lr_gamma", 0.1),
+        )
+    
+    return None

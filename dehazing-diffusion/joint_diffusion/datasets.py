@@ -1,26 +1,18 @@
-"""Load / generate datasets.
+"""Load / generate datasets (PyTorch version).
 Author(s): Tristan Stevens
+Ported to PyTorch: Jan 2026
+
+Note: Only ZEA datasets are fully supported. Legacy TF datasets (MNIST, CelebA, etc.)
+have been removed. If needed, they can be reimplemented using torchvision.
 """
 
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
-import tensorflow as tf
-from keras.utils import to_categorical
-from sklearn.model_selection import train_test_split
-
-from utils.signals import RandomTranslation, grayscale_to_random_rgb
-from utils.utils import download_and_unpack, get_normalization_layer
-
-AUTOTUNE = tf.data.AUTOTUNE
+import torch
+from torch.utils.data import Dataset, DataLoader
 
 _DATASETS = [
-    "mnist",
-    "celeba",
-    "sinenoise",
-    "sinenoise1d",
-    "tmnist",
     "zea_tissue",
     "zea_haze",
 ]
@@ -34,440 +26,37 @@ def get_dataset(config):
         config (dict): config dict.
 
     Returns:
-        tuple(Dataset, Dataset)
-            Tuple of train-, and test-dataloader respectively
+        tuple(DataLoader, DataLoader)
+            Tuple of train-, and val-dataloader respectively
     """
     dataset_name = config["dataset_name"]
 
     assert (
         dataset_name.lower() in _DATASETS
     ), f"""Invalid dataset name {dataset_name.lower()} found in config file.
-        Should be in {_DATASETS}."""
+        Supported datasets: {_DATASETS}."""
 
     print(f"Loading {dataset_name} dataset...")
 
-    if dataset_name.lower() == "mnist":
-        train, test = _get_mnist(config)
-    if dataset_name.lower() == "celeba":
-        train, test = _get_celeba(config)
-    if dataset_name.lower() == "sinenoise":
-        train, test = _get_sine_noise_dataset(config)
-    if dataset_name.lower() == "sinenoise1d":
-        train, test = _get_sine_noise1D_dataset(config)
-    if dataset_name.lower() == "tmnist":
-        train, test = _get_tmnist(config)
     if dataset_name.lower() == "zea_tissue":
         return _get_zea_dataset(config, "tissue")
     if dataset_name.lower() == "zea_haze":
         return _get_zea_dataset(config, "haze")
 
-    datasets = train, test
-    dataset = datasets[datasets != None]
-    ## check image shape after all transforms
-    try:
-        # fast way, but somehow not always possible
-        image_shape = dataset.element_spec.shape[1:].as_list()
-    except:
-        # slow way, literally reading a sample and checking the size
-        image_shape = list(tf.shape(next(iter(dataset))))[1:]
-
-    config.image_shape = image_shape
-
-    if train:
-        train = train.prefetch(buffer_size=AUTOTUNE)
-    if test:
-        test = test.prefetch(buffer_size=AUTOTUNE)
-
-    return train, test
-
-
-def _get_mnist(config):
-    """Loads MNIST dataset.
-
-    Loads and preprocesses MNIST dataset into a train and test dataloader.
-
-    Args:
-        config (dict): config dict.
-
-    Returns:
-        tuple(Dataset, Dataset)
-            Tuple of train-, and test-dataloader respectively
-    """
-    default_image_size = 28
-
-    image_size = config.get("image_size") or default_image_size
-    image_range = config.get("image_range", [-1, 1])
-    color_mode = config.get("color_mode", "grayscale")
-    seed = config.get("seed", None)
-    shuffle = config.get("shuffle", True)
-    batch_size = config.get("batch_size")
-
-    if isinstance(image_size, int):
-        image_size = (image_size, image_size)
-
-    (train_images, train_labels), (
-        test_images,
-        test_labels,
-    ) = tf.keras.datasets.mnist.load_data()
-
-    # create dataset
-    train_dataset = tf.data.Dataset.from_tensor_slices(train_images)
-    test_dataset = tf.data.Dataset.from_tensor_slices(test_images)
-
-    # shuffle
-    if shuffle:
-        train_dataset = train_dataset.shuffle(len(train_images), seed=seed)
-        test_dataset = test_dataset.shuffle(len(test_dataset), seed=seed)
-
-    # limit number of samples
-    if config.get("limit_n_samples"):
-        train_dataset = train_dataset.take(config.limit_n_samples)
-        test_dataset = test_dataset.take(config.limit_n_samples)
-
-    print(f"Using {len(train_dataset)} files for training.")
-    print(f"Using {len(test_dataset)} files for validation.")
-
-    # batch
-    if batch_size:
-        train_dataset = train_dataset.batch(batch_size)
-        test_dataset = test_dataset.batch(batch_size)
-
-    # transforms
-    transforms = []
-    transforms.append(lambda x: tf.expand_dims(x, axis=-1))
-    transforms.append(lambda x: tf.image.resize(x, image_size))
-    transforms.append(lambda x: get_normalization_layer(*image_range)(x))
-    if color_mode == "rgb":
-        transforms.append(lambda x: grayscale_to_random_rgb(x, (None, *image_size, 3)))
-    if config.get("translation"):
-        translate_random = RandomTranslation(config.translation, config.translation)
-        transforms.append(lambda x: translate_random(x, (None, *image_size, 3)))
-
-    for transform in transforms:
-        train_dataset = train_dataset.map(transform, num_parallel_calls=AUTOTUNE)
-        test_dataset = test_dataset.map(transform, num_parallel_calls=AUTOTUNE)
-
-    train_dataset = train_dataset.prefetch(buffer_size=AUTOTUNE)
-
-    return train_dataset, test_dataset
-
-
-def _get_tmnist(config):
-    """Loads TMNIST-alpha dataset.
-
-    https://www.kaggle.com/datasets/nikbearbrown/tmnist-alphabet-94-characters
-
-    Loads and preprocesses TMNIST-alpha dataset with 94 charachters
-    into a train and test dataloader.
-
-    Args:
-        config (dict): config dict.
-
-    Returns:
-        tuple(Dataset, Dataset)
-            Tuple of train-, and test-dataloader respectively
-    """
-
-    def _tmnist_load_data(data_root, validation_split=0.2):
-        dataset_file = Path(data_root) / "images/TMNIST/tmnist_dataset.npy"
-        if dataset_file.is_file():
-            dataset = np.load(dataset_file, allow_pickle=True).item()
-            X_train = dataset["X_train"]
-            y_train = dataset["y_train"]
-            X_test = dataset["X_test"]
-            y_test = dataset["y_test"]
-        else:
-            csv_file = Path(data_root) / "images/TMNIST/94_character_TMNIST.csv"
-
-            df = pd.read_csv(csv_file)
-            X = df.iloc[:, 2:].astype("float32")
-            y = df[["labels"]]
-
-            labels = y["labels"].unique()
-            values = [num for num in range(len(df["labels"].unique()))]
-            label_dict = dict(zip(labels, values))
-
-            y["labels"].replace(label_dict, inplace=True)
-
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=validation_split
-            )
-
-            Length, Height = 28, 28  # <---- Defining LxH
-            NCl = y_train.nunique()[0]  # Unique targets -- > 94
-
-            # ------>  N of images 28x28
-            X_train = np.reshape(X_train.values, (X_train.shape[0], Length, Height))
-            X_test = np.reshape(X_test.values, (X_test.shape[0], Length, Height))
-
-            # -------> Target into Categorical Values
-            y_train = to_categorical(y_train, NCl, dtype="int")
-            y_test = to_categorical(y_test, NCl, dtype="int")
-
-            save_dict = {
-                "X_train": X_train,
-                "y_train": y_train,
-                "X_test": X_test,
-                "y_test": y_test,
-            }
-
-            np.save(dataset_file, save_dict)
-
-        return (X_train, y_train), (X_test, y_test)
-
-    default_image_size = 28
-
-    data_root = Path(config.data_root)
-    image_size = config.get("image_size") or default_image_size
-    image_range = config.get("image_range", [-1, 1])
-    color_mode = config.get("color_mode", "grayscale")
-    seed = config.get("seed", None)
-    shuffle = config.get("shuffle", True)
-    batch_size = config.get("batch_size")
-    validation_split = config.get("validation_split", 0.2)
-
-    if isinstance(image_size, int):
-        image_size = (image_size, image_size)
-
-    (train_images, train_labels), (test_images, test_labels) = _tmnist_load_data(
-        data_root, validation_split
-    )
-
-    # create dataset
-    train_dataset = tf.data.Dataset.from_tensor_slices(train_images)
-    test_dataset = tf.data.Dataset.from_tensor_slices(test_images)
-
-    # shuffle
-    if shuffle:
-        train_dataset = train_dataset.shuffle(len(train_images), seed=seed)
-        test_dataset = test_dataset.shuffle(len(test_dataset), seed=seed)
-
-    # limit number of samples
-    if config.get("limit_n_samples"):
-        train_dataset = train_dataset.take(config.limit_n_samples)
-        test_dataset = test_dataset.take(config.limit_n_samples)
-
-    print(f"Using {len(train_dataset)} files for training.")
-    print(f"Using {len(test_dataset)} files for validation.")
-
-    # batch
-    if batch_size:
-        train_dataset = train_dataset.batch(batch_size)
-        test_dataset = test_dataset.batch(batch_size)
-
-    # transforms
-    transforms = []
-    transforms.append(lambda x: tf.expand_dims(x, axis=-1))
-    transforms.append(lambda x: tf.image.resize(x, image_size))
-    transforms.append(lambda x: get_normalization_layer(*image_range)(x))
-    if color_mode == "rgb":
-        transforms.append(lambda x: grayscale_to_random_rgb(x, (None, *image_size, 3)))
-
-    for transform in transforms:
-        train_dataset = train_dataset.map(transform, num_parallel_calls=AUTOTUNE)
-        test_dataset = test_dataset.map(transform, num_parallel_calls=AUTOTUNE)
-
-    train_dataset = train_dataset.prefetch(buffer_size=AUTOTUNE)
-
-    return train_dataset, test_dataset
-
-
-def _get_celeba(config):
-    """Loads CelebA dataset.
-
-    Downloaded using:
-        wget https://openaipublic.azureedge.net/glow-demo/data/celeba-tfr.tar
-        tar -xvf celeb-tfr.tar
-        update: gets automatically downloaded
-
-    Required directory:
-        data_root / 'images' / 'celeba-tfr'
-
-    Loads and preprocesses Celeb dataset into a train and test dataloader.
-
-    Args:
-        dataset_config (dict): config dict.
-
-    Returns:
-        tuple(Dataset, Dataset)
-            Tuple of train-, and test-dataloader respectively
-
-    """
-    data_root = Path(config.data_root)
-
-    default_image_size = 256
-    image_size = config.get("image_size") or default_image_size
-    config.image_size = image_size
-
-    image_range = config.get("image_range", [-1, 1])
-    color_mode = config.get("color_mode", "rgb")
-    seed = config.get("seed", None)
-    shuffle = config.get("shuffle", True)
-    batch_size = config.get("batch_size")
-
-    if isinstance(image_size, int):
-        image_size = (image_size, image_size)
-
-    path = data_root / "images" / "celeba-tfr"
-    if not path.is_dir():
-        download_and_unpack(
-            url="https://openaipublic.azureedge.net/glow-demo/data/celeba-tfr.tar",
-            save_path=path.parent,
-        )
-        # rename `train` to `training` folder for consistency with other datasets
-        (path / "train").rename(path / "training")
-
-    datasets = []
-
-    features = {
-        "shape": tf.io.FixedLenFeature([3], tf.int64),
-        "data": tf.io.FixedLenFeature([], tf.string),
-        "label": tf.io.FixedLenFeature([1], tf.int64),
-        "attr": tf.io.FixedLenFeature([40], tf.int64),
-    }
-
-    def _parse_tf_record(record):
-        r = tf.io.parse_single_example(record, features)
-        data, label, shape, attr = r["data"], r["label"], r["shape"], r["attr"]
-        img = tf.io.decode_raw(data, tf.uint8)
-        # label = tf.cast(tf.reshape(label, shape=[]), dtype=tf.int32)
-        # res = 256
-        # img = tf.reshape(img, [res, res, 3])
-        img = tf.reshape(img, shape)
-        return img
-
-    for dataset_type in ["training", "validation"]:
-        # create dataset
-        data_path = path / dataset_type
-        files = [str(file) for file in Path(data_path).glob("*.tfrecords")]
-        dataset = tf.data.TFRecordDataset(files)
-
-        # parse
-        dataset = dataset.map(_parse_tf_record, num_parallel_calls=AUTOTUNE)
-
-        # limit number of samples
-        if config.get("limit_n_samples"):
-            dataset = dataset.take(config.limit_n_samples)
-
-        n_samples = sum(1 for record in dataset)
-        dataset = dataset.apply(tf.data.experimental.assert_cardinality(n_samples))
-        print(f"Using {n_samples} files for {dataset_type}.")
-
-        # shuffle
-        if shuffle:
-            dataset = dataset.shuffle(n_samples, seed=seed)
-
-        # batch
-        if batch_size:
-            dataset = dataset.batch(batch_size)
-
-        datasets.append(dataset)
-
-    train_dataset, test_dataset = datasets
-
-    # transforms
-    transforms = []
-
-    # resize
-    transforms.append(lambda x: tf.image.resize(x, image_size))
-    transforms.append(lambda x: tf.ensure_shape(x, (None, *image_size, 3)))
-
-    if color_mode == "grayscale":
-        transforms.append(lambda x: tf.image.rgb_to_grayscale(x))
-
-    # normalize
-    transforms.append(lambda x: get_normalization_layer(*image_range)(x))
-
-    for transform in transforms:
-        train_dataset = train_dataset.map(transform, num_parallel_calls=AUTOTUNE)
-        test_dataset = test_dataset.map(transform, num_parallel_calls=AUTOTUNE)
-
-    return train_dataset, test_dataset
-
-
-def _get_sine_noise_dataset(config):
-    image_size = config["image_size"]
-    noise_stddev = config["noise_stddev"]
-    batch_size = config["batch_size"]
-
-    if isinstance(image_size, int):
-        image_size = (image_size, image_size)
-
-    if config["color_mode"] == "rgb":
-        image_shape = [batch_size, *image_size, 3]
-    else:
-        image_shape = [batch_size, *image_size, 1]
-
-    if isinstance(noise_stddev, int):
-        noise_stddev = (noise_stddev, noise_stddev)
-
-    def sine_noise_gen():
-        stddev = np.exp(np.sin(2 * np.pi * np.arange(image_shape[1]) / 16))
-        stddev_matrix = np.transpose(np.zeros(image_shape), (1, 2, 3, 0))
-        stddev_matrix += stddev[:, None, None, None]
-        stddev_matrix = np.transpose(stddev_matrix, (3, 0, 1, 2))
-        while True:
-            noise_pattern = tf.random.normal(stddev_matrix.shape, stddev=stddev_matrix)
-            noise_pattern *= tf.random.uniform(
-                (batch_size, 1, 1, 1), *noise_stddev
-            ) / tf.math.reduce_std(noise_pattern)
-            yield noise_pattern
-
-    dataset = tf.data.Dataset.from_generator(
-        sine_noise_gen,
-        output_signature=tf.TensorSpec(shape=image_shape, dtype=tf.float32),
-    )
-    return dataset, dataset
-
-
-def _get_sine_noise1D_dataset(config):
-    image_size = config["image_size"]
-    noise_stddev = config["noise_stddev"]
-    batch_size = config["batch_size"]
-    subsample_factor = config["subsample_factor"]
-
-    if isinstance(image_size, int):
-        image_size = (image_size, image_size)
-
-    if config["color_mode"] == "rgb":
-        image_shape = [batch_size, int(np.prod(image_size) * 3 / subsample_factor)]
-    else:
-        image_shape = [batch_size, int(np.prod(image_size) / subsample_factor)]
-
-    image_shape = image_shape + [1, 1]
-
-    if isinstance(noise_stddev, int):
-        noise_stddev = (noise_stddev, noise_stddev)
-
-    def sine_noise_gen():
-        stddev = np.exp(np.sin(2 * np.pi * np.arange(image_shape[1]) / 16))
-        stddev_matrix = np.zeros(image_shape)
-        stddev_matrix += stddev[:, None, None]
-        while True:
-            noise_pattern = tf.random.normal(stddev_matrix.shape, stddev=stddev_matrix)
-            # vary magnitude
-            noise_pattern *= tf.random.uniform(
-                (batch_size, 1, 1, 1), *noise_stddev
-            ) / tf.math.reduce_std(noise_pattern)
-            yield noise_pattern
-
-    dataset = tf.data.Dataset.from_generator(
-        sine_noise_gen,
-        output_signature=tf.TensorSpec(shape=image_shape, dtype=tf.float32),
-    )
-    return dataset, dataset
-
-
-# --- ZEA dataset (PyTorch) ---
-
-import torch
-from torch.utils.data import Dataset, DataLoader
+    raise ValueError(f"Dataset {dataset_name} not supported")
 
 
 class ZeaDataset(Dataset):
     """PyTorch Dataset for ZEA synthetic RF data (tissue or haze)."""
 
     def __init__(self, npz_path, npz_key="rf", image_range=(0, 1), limit_n=None):
+        """
+        Args:
+            npz_path: Path to the .npz file
+            npz_key: Key in NPZ file to load data from
+            image_range: Tuple (min, max) to normalize data to
+            limit_n: Optional limit on number of samples
+        """
         data = np.load(npz_path)[npz_key].astype(np.float32)
         # Stored shape: (N, n_tx, n_ax, n_el) — use all transmits as channels
         # Already in (N, C, H, W) format where C=n_tx
@@ -475,6 +64,10 @@ class ZeaDataset(Dataset):
             data = data[:limit_n]
         # Normalize to image_range
         lo, hi = image_range
+        # Assume data is in [0, 1] or needs normalization
+        data_min, data_max = data.min(), data.max()
+        if data_max > data_min:
+            data = (data - data_min) / (data_max - data_min)  # normalize to [0, 1]
         data = data * (hi - lo) + lo
         self.data = torch.from_numpy(data)
 
@@ -488,6 +81,10 @@ class ZeaDataset(Dataset):
 def _get_zea_dataset(config, kind: str):
     """Load ZEA synthetic RF dataset (tissue or haze).
 
+    Args:
+        config: Configuration dict/object with data_root, batch_size, etc.
+        kind: Either "tissue" or "haze"
+
     Returns:
         Tuple of (train_loader, val_loader)
     """
@@ -498,6 +95,7 @@ def _get_zea_dataset(config, kind: str):
     shuffle = config.get("shuffle", True)
     seed = config.get("seed", None)
     limit_n = config.get("limit_n_samples", None)
+    num_workers = config.get("num_workers", 0)
 
     train_path = data_root / "zea_synth" / kind / "train.npz"
     val_path = data_root / "zea_synth" / kind / "val.npz"
@@ -506,15 +104,72 @@ def _get_zea_dataset(config, kind: str):
         raise FileNotFoundError(f"ZEA dataset not found: {train_path}")
 
     train_ds = ZeaDataset(train_path, npz_key, image_range, limit_n)
-    val_ds = ZeaDataset(val_path, npz_key, image_range, limit_n)
+    
+    if val_path.exists():
+        val_ds = ZeaDataset(val_path, npz_key, image_range, limit_n)
+    else:
+        # If no val set, use a portion of training
+        print(f"Validation file not found at {val_path}, using last 10% of train")
+        n_val = max(1, len(train_ds) // 10)
+        train_ds, val_ds = torch.utils.data.random_split(
+            train_ds, [len(train_ds) - n_val, n_val]
+        )
 
-    print(f"Using {len(train_ds)} files for training.")
-    print(f"Using {len(val_ds)} files for validation.")
+    print(f"Using {len(train_ds)} samples for training.")
+    print(f"Using {len(val_ds)} samples for validation.")
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=shuffle)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+    # Create data loaders
+    generator = torch.Generator()
+    if seed is not None:
+        generator.manual_seed(seed)
 
-    n_tx = train_ds.data.shape[1]  # number of transmits = number of channels
-    config.image_shape = [n_tx, *config.get("image_size", [128, 64])]
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=True,
+        generator=generator if shuffle else None,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
 
+    # Set image shape in config
+    sample = train_ds[0] if hasattr(train_ds, '__getitem__') else train_ds.dataset[train_ds.indices[0]]
+    n_channels = sample.shape[0]
+    config.image_shape = [n_channels, *config.get("image_size", [128, 64])]
+    
     return train_loader, val_loader
+
+
+# ===== Utility functions for data loading =====
+
+def get_batch_from_loader(loader, num=None):
+    """Get a single batch from a DataLoader.
+    
+    Args:
+        loader: PyTorch DataLoader
+        num: Optional, limit batch to first `num` samples
+    
+    Returns:
+        Batch tensor
+    """
+    batch = next(iter(loader))
+    if num is not None and num < len(batch):
+        batch = batch[:num]
+    return batch
+
+
+def collate_paired(batch):
+    """Collate function for paired data (noisy, clean)."""
+    if isinstance(batch[0], tuple):
+        noisy = torch.stack([b[0] for b in batch])
+        clean = torch.stack([b[1] for b in batch])
+        return noisy, clean
+    else:
+        return torch.stack(batch)
