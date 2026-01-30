@@ -1,10 +1,11 @@
-"""Abstract SDE classes, Reverse SDE, and VE/VP SDEs."""
+"""Abstract SDE classes, Reverse SDE, and VE/VP SDEs.
+Ported from TensorFlow to PyTorch.
+Reference: score_sde_pytorch/sde_lib.py (Yang Song)
+"""
 import abc
 
 import numpy as np
-import tensorflow as tf
-
-from utils.utils import tf_expand_multiple_dims
+import torch
 
 
 class SDE(abc.ABC):
@@ -54,24 +55,23 @@ class SDE(abc.ABC):
         pass
 
     def forward_diffuse(self, x, t):
-        """Compute x_hat_t ~ p(x_t|x_0)
-        Comput forward diffusion using marginal_prob mean / std
-        """
+        """Compute x_hat_t ~ p(x_t|x_0) using marginal_prob mean / std."""
         x_hat, std = self.marginal_prob(x, t)
-        shape = tf.shape(x_hat)
-        std = tf_expand_multiple_dims(std, len(shape) - 1)
-        x_hat = x_hat + tf.random.normal(shape) * std
+        # Expand std to match spatial dims
+        while std.dim() < x_hat.dim():
+            std = std.unsqueeze(-1)
+        x_hat = x_hat + torch.randn_like(x_hat) * std
         return x_hat
 
     def discretize(self, x, t):
         """Discretize the SDE in the form: x_{i+1} = x_i + f_i(x_i) + G_i z_i.
 
-        Useful for reverse diffusion sampling and probabiliy flow sampling.
+        Useful for reverse diffusion sampling and probability flow sampling.
         Defaults to Euler-Maruyama discretization.
 
         Args:
-            x: a TensorFlow tensor
-            t: a TensorFlow float representing the time step (from 0 to `self.T`)
+            x: a torch tensor
+            t: a torch float representing the time step (from 0 to `self.T`)
 
         Returns:
             f, G
@@ -79,7 +79,7 @@ class SDE(abc.ABC):
         dt = 1 / self.N
         drift, diffusion = self.sde(x, t)
         f = drift * dt
-        G = diffusion * tf.math.sqrt(dt)
+        G = diffusion * torch.sqrt(torch.tensor(dt, device=t.device))
         return f, G
 
     def reverse(self, score_fn, probability_flow=False):
@@ -97,7 +97,7 @@ class SDE(abc.ABC):
         discretize_fn = self.discretize
 
         # Build the class for reverse-time SDE.
-        class RSDE:
+        class RSDE(self.__class__):
             """Reverse SDE class."""
 
             def __init__(self):
@@ -126,7 +126,7 @@ class SDE(abc.ABC):
                 rev_f = f - G[:, None, None, None] ** 2 * score_fn(x, t) * (
                     0.5 if self.probability_flow else 1.0
                 )
-                rev_G = tf.zeros_like(G) if self.probability_flow else G
+                rev_G = torch.zeros_like(G) if self.probability_flow else G
                 return rev_f, rev_G
 
         return RSDE()
@@ -147,11 +147,11 @@ class VPSDE(SDE):
         self.beta_0 = float(beta_min)
         self.beta_1 = float(beta_max)
         self.N = N
-        self.discrete_betas = tf.linspace(beta_min / N, beta_max / N, N)
+        self.discrete_betas = torch.linspace(beta_min / N, beta_max / N, N)
         self.alphas = 1.0 - self.discrete_betas
-        self.alphas_cumprod = tf.math.cumprod(self.alphas, axis=0)
-        self.sqrt_alphas_cumprod = tf.math.sqrt(self.alphas_cumprod)
-        self.sqrt_1m_alphas_cumprod = tf.math.sqrt(1.0 - self.alphas_cumprod)
+        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
+        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
+        self.sqrt_1m_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
 
     @property
     def T(self):
@@ -160,38 +160,36 @@ class VPSDE(SDE):
     def sde(self, x, t):
         beta_t = self.beta_0 + t * (self.beta_1 - self.beta_0)
         drift = -0.5 * beta_t[:, None, None, None] * x
-        diffusion = tf.math.sqrt(beta_t)
+        diffusion = torch.sqrt(beta_t)
         return drift, diffusion
 
     def marginal_prob(self, x, t):
         log_mean_coeff = (
             -0.25 * t**2 * (self.beta_1 - self.beta_0) - 0.5 * t * self.beta_0
         )
-        mean = (
-            tf.math.exp(tf.reshape(log_mean_coeff, (-1, *[1] * (len(x.shape) - 1)))) * x
-        )
-        std = tf.math.sqrt(1.0 - tf.math.exp(2.0 * log_mean_coeff))
+        mean = torch.exp(log_mean_coeff[:, None, None, None]) * x
+        std = torch.sqrt(1.0 - torch.exp(2.0 * log_mean_coeff))
         return mean, std
 
     def prior_sampling(self, shape):
-        return tf.random.normal(shape)
+        return torch.randn(*shape)
 
     def prior_logp(self, z):
-        shape = tf.shape(z)
-        N = tf.reduce_prod(shape[1:])
+        shape = z.shape
+        N = np.prod(shape[1:])
         logps = (
-            -N / 2.0 * tf.math.log(2 * np.pi)
-            - tf.reduce_sum(z**2, axis=(1, 2, 3)) / 2.0
+            -N / 2.0 * np.log(2 * np.pi)
+            - torch.sum(z**2, dim=(1, 2, 3)) / 2.0
         )
         return logps
 
     def discretize(self, x, t):
         """DDPM discretization."""
-        timestep = tf.cast(t * (self.N - 1) / self.T, dtype=tf.int64)
-        beta = tf.gather(self.discrete_betas, timestep)
-        alpha = tf.gather(self.alphas, timestep)
-        sqrt_beta = tf.math.sqrt(beta)
-        f = tf.math.sqrt(alpha)[:, None, None, None] * x - x
+        timestep = (t * (self.N - 1) / self.T).long()
+        beta = self.discrete_betas.to(x.device)[timestep]
+        alpha = self.alphas.to(x.device)[timestep]
+        sqrt_beta = torch.sqrt(beta)
+        f = torch.sqrt(alpha)[:, None, None, None] * x - x
         G = sqrt_beta
         return f, G
 
@@ -211,7 +209,7 @@ class subVPSDE(SDE):
         self.beta_0 = float(beta_min)
         self.beta_1 = float(beta_max)
         self.N = N
-        self.discrete_betas = tf.linspace(beta_min / N, beta_max / N, N)
+        self.discrete_betas = torch.linspace(beta_min / N, beta_max / N, N)
         self.alphas = 1.0 - self.discrete_betas
 
     @property
@@ -221,29 +219,29 @@ class subVPSDE(SDE):
     def sde(self, x, t):
         beta_t = self.beta_0 + t * (self.beta_1 - self.beta_0)
         drift = -0.5 * beta_t[:, None, None, None] * x
-        discount = 1.0 - tf.math.exp(
+        discount = 1.0 - torch.exp(
             -2 * self.beta_0 * t - (self.beta_1 - self.beta_0) * t**2
         )
-        diffusion = tf.math.sqrt(beta_t * discount)
+        diffusion = torch.sqrt(beta_t * discount)
         return drift, diffusion
 
     def marginal_prob(self, x, t):
         log_mean_coeff = (
             -0.25 * t**2 * (self.beta_1 - self.beta_0) - 0.5 * t * self.beta_0
         )
-        mean = tf.math.exp(log_mean_coeff)[:, None, None, None] * x
-        std = 1 - tf.math.exp(2.0 * log_mean_coeff)
+        mean = torch.exp(log_mean_coeff)[:, None, None, None] * x
+        std = 1 - torch.exp(2.0 * log_mean_coeff)
         return mean, std
 
     def prior_sampling(self, shape):
-        return tf.random.normal(shape)
+        return torch.randn(*shape)
 
     def prior_logp(self, z):
-        shape = tf.shape(z)
-        N = tf.reduce_prod(shape[1:])
+        shape = z.shape
+        N = np.prod(shape[1:])
         return (
-            -N / 2.0 * tf.math.log(2 * np.pi)
-            - tf.reduce_sum(z**2, axis=(1, 2, 3)) / 2.0
+            -N / 2.0 * np.log(2 * np.pi)
+            - torch.sum(z**2, dim=(1, 2, 3)) / 2.0
         )
 
 
@@ -261,8 +259,10 @@ class VESDE(SDE):
         super().__init__(N)
         self.sigma_min = float(sigma_min)
         self.sigma_max = float(sigma_max)
-        self.discrete_sigmas = tf.math.exp(
-            tf.linspace(tf.math.log(self.sigma_min), tf.math.log(self.sigma_max), N)
+        self.discrete_sigmas = torch.exp(
+            torch.linspace(
+                np.log(self.sigma_min), np.log(self.sigma_max), N
+            )
         )
         self.N = N
 
@@ -272,9 +272,12 @@ class VESDE(SDE):
 
     def sde(self, x, t):
         sigma = self.sigma_min * (self.sigma_max / self.sigma_min) ** t
-        drift = tf.zeros_like(x)
-        diffusion = sigma * tf.math.sqrt(
-            (2 * (tf.math.log(self.sigma_max) - tf.math.log(self.sigma_min)))
+        drift = torch.zeros_like(x)
+        diffusion = sigma * torch.sqrt(
+            torch.tensor(
+                2 * (np.log(self.sigma_max) - np.log(self.sigma_min)),
+                device=t.device,
+            )
         )
         return drift, diffusion
 
@@ -284,26 +287,27 @@ class VESDE(SDE):
         return mean, std
 
     def prior_sampling(self, shape):
-        return tf.random.normal(shape) * self.sigma_max
+        return torch.randn(*shape) * self.sigma_max
 
     def prior_logp(self, z):
-        shape = tf.shape(z)
-        N = tf.reduce_prod(shape[1:])
-        return -N / 2.0 * tf.math.log(2 * np.pi * self.sigma_max**2) - tf.reduce_sum(
-            z**2, axis=(1, 2, 3)
-        ) / (2 * self.sigma_max**2)
+        shape = z.shape
+        N = np.prod(shape[1:])
+        return (
+            -N / 2.0 * np.log(2 * np.pi * self.sigma_max**2)
+            - torch.sum(z**2, dim=(1, 2, 3)) / (2 * self.sigma_max**2)
+        )
 
     def discretize(self, x, t):
         """SMLD(NCSN) discretization."""
-        timestep = tf.cast(t * (self.N - 1) / self.T, dtype=tf.int64)
-        sigma = tf.gather(self.discrete_sigmas, timestep)
-        adjacent_sigma = tf.where(
+        timestep = (t * (self.N - 1) / self.T).long()
+        sigma = self.discrete_sigmas.to(t.device)[timestep]
+        adjacent_sigma = torch.where(
             timestep == 0,
-            tf.zeros_like(t),
-            tf.gather(self.discrete_sigmas, timestep - 1),
+            torch.zeros_like(t),
+            self.discrete_sigmas.to(t.device)[timestep - 1],
         )
-        f = tf.zeros_like(x)
-        G = tf.math.sqrt(sigma**2 - adjacent_sigma**2)
+        f = torch.zeros_like(x)
+        G = torch.sqrt(sigma**2 - adjacent_sigma**2)
         return f, G
 
 
@@ -326,24 +330,25 @@ class simple(SDE):
         return 1.0
 
     def sde(self, x, t):
-        drift = tf.zeros_like(x)
+        drift = torch.zeros_like(x)
         diffusion = self.sigma**t
         return drift, diffusion
 
     def marginal_prob(self, x, t):
-        std = tf.math.sqrt(
-            (self.sigma ** (2 * t) - 1.0) / 2.0 / tf.math.log(self.sigma)
+        std = torch.sqrt(
+            (self.sigma ** (2 * t) - 1.0) / 2.0 / np.log(self.sigma)
         )
         mean = x
         return mean, std
 
     def prior_sampling(self, shape):
-        return tf.random.normal(shape)
+        return torch.randn(*shape)
 
     def prior_logp(self, z):
-        shape = tf.shape(z)
-        N = tf.reduce_prod(shape[1:])
-        logps = -N / 2.0 * tf.math.log(2 * np.pi * self.sigma**2) - tf.reduce_sum(
-            z**2, axis=(1, 2, 3)
-        ) / (2 * self.sigma**2)
+        shape = z.shape
+        N = np.prod(shape[1:])
+        logps = (
+            -N / 2.0 * np.log(2 * np.pi * self.sigma**2)
+            - torch.sum(z**2, dim=(1, 2, 3)) / (2 * self.sigma**2)
+        )
         return logps

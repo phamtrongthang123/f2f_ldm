@@ -1,9 +1,10 @@
-"""Guidance class for joint posterior sampling
+"""Guidance class for joint posterior sampling.
+Ported from TensorFlow to PyTorch.
 Author(s): Tristan Stevens
 """
 import abc
 
-import tensorflow as tf
+import torch
 
 _GUIDANCE = {}
 
@@ -12,10 +13,7 @@ def register_guidance(cls=None, *, name=None):
     """A decorator for registering guidance classes."""
 
     def _register(cls):
-        if name is None:
-            local_name = cls.__name__
-        else:
-            local_name = name
+        local_name = name if name is not None else cls.__name__
         if local_name in _GUIDANCE:
             raise ValueError(f"Already registered guidance with name: {local_name}")
         _GUIDANCE[local_name] = cls
@@ -40,22 +38,25 @@ class Guidance(abc.ABC):
         self.corruptor = corruptor
         self.lambda_coeff = lambda_coeff
         self.kappa_coeff = kappa_coeff
-        self.A = self.corruptor.A
+        self.A = self.corruptor.A if self.corruptor is not None else None
         if self.A is not None:
-            self.A_T = tf.transpose(self.A)
+            if isinstance(self.A, torch.Tensor):
+                self.A_T = self.A.t()
+            else:
+                import numpy as np
+                self.A = torch.from_numpy(np.array(self.A)).float()
+                self.A_T = self.A.t()
 
-    @tf.function
     def update_fn(self, y, x, t, x_mean, grad_x0_xt=None):
-        """One update for guidance"""
+        """One update for guidance."""
         if self.corruptor.name in ["gaussian", "mnist", "cs", "cs_sine"]:
             x = self.denoise_update(y, x, t, x_mean, grad_x0_xt)
         else:
             raise ValueError(f"Unknown corruptor: {self.corruptor.name}")
         return x
 
-    @tf.function
     def joint_update_fn(self, y, x, n, t, x_mean, n_mean, grad_x0_xt, grad_n0_nt):
-        """One update for guidance"""
+        """One update for joint guidance."""
         if self.corruptor.name in ["gaussian", "mnist", "cs", "cs_sine"]:
             x, n = self.joint_denoise_update(
                 y, x, n, t, x_mean, n_mean, grad_x0_xt, grad_n0_nt
@@ -67,7 +68,7 @@ class Guidance(abc.ABC):
 
 @register_guidance(name="pigdm")
 class PIGDM(Guidance):
-    """Pseudo inverse guidance
+    """Pseudo inverse guidance.
     https://openreview.net/forum?id=9_gsMA8MRKQ
     """
 
@@ -81,40 +82,42 @@ class PIGDM(Guidance):
         """Compute denoising data consistency step for Gaussian noise."""
         assert grad_x0_xt is not None, "Gradients for p(x_0|t | x_t) were not provided"
 
-        r_t_squared = self.rt_squared(x, t)[:, None, None, None]
+        r_t_squared = self.rt_squared(x, t)
+        # Expand to spatial dims
+        while r_t_squared.dim() < x.dim():
+            r_t_squared = r_t_squared.unsqueeze(-1)
 
         # compressed sensing y = Ax + n
         if self.A is not None:
-            m, d = tf.shape(self.A)
-            I = tf.eye(m, m)
+            A = self.A.to(x.device)
+            A_T = self.A_T.to(x.device)
+            m, d = A.shape
+            I = torch.eye(m, device=x.device)
 
-            # flatten x_0t and dx_0t_xt
-            x_mean = tf.reshape(x_mean, (self.batch_size, -1))
-            grad_x0_xt = tf.reshape(grad_x0_xt, (self.batch_size, -1))
+            # flatten x_mean and grad
+            x_mean_flat = x_mean.reshape(self.batch_size, -1)
+            grad_flat = grad_x0_xt.reshape(self.batch_size, -1)
 
-            # posterior mean p(x0|xt) = A x_0
-            mu_t = tf.linalg.matmul(x_mean, self.A_T)
-            # posterior variance p(x0|xt) = sigma_xt^2 A A^T + sigma_y^2 I
+            # posterior mean: A x_0
+            mu_t = x_mean_flat @ A_T
+            # posterior variance
             sigma_t = (
-                r_t_squared * tf.linalg.matmul(self.A, self.A_T)
-                + self.corruptor.noise_stddev**2 * I
+                r_t_squared.reshape(-1, 1, 1) * (A @ A_T).unsqueeze(0)
+                + self.corruptor.noise_stddev**2 * I.unsqueeze(0)
             )
-            sigma_t_inv = tf.linalg.inv(sigma_t)
-            sigma_inv_A = tf.linalg.matmul(sigma_t_inv, self.A)
+            sigma_t_inv = torch.linalg.inv(sigma_t)
+            sigma_inv_A = sigma_t_inv @ A.unsqueeze(0)
 
-            # ∇_xt p(y | x_t) = (y - mu_t) inv(sigma_t) A * dx_0t_xt
-            grad_p_y_xt = tf.linalg.matmul(y - mu_t, sigma_inv_A) * grad_x0_xt
-            grad_p_y_xt = tf.reshape(grad_p_y_xt, (self.batch_size, *self.image_shape))
+            y_flat = y.reshape(self.batch_size, -1)
+            grad_p_y_xt = ((y_flat - mu_t).unsqueeze(1) @ sigma_inv_A).squeeze(1) * grad_flat
+            grad_p_y_xt = grad_p_y_xt.reshape(self.batch_size, *self.image_shape)
 
         # denoising y = x + n
         else:
-            # x_t-1 = x_t + λ * (y - x_0) * dx_0_dx_t / sigma_t
             sigma_t = self.corruptor.noise_stddev**2 + r_t_squared
             grad_p_y_xt = grad_x0_xt * (y - x_mean) / sigma_t
 
-        # data consistency step for x
         x = x + self.lambda_coeff * r_t_squared * grad_p_y_xt
-
         return x
 
     def joint_denoise_update(self, y, x, n, t, x_mean, n_mean, grad_x0_xt, grad_n0_nt):
@@ -122,36 +125,42 @@ class PIGDM(Guidance):
         assert grad_x0_xt is not None, "Gradients for p(x_0|t | x_t) were not provided"
         assert grad_n0_nt is not None, "Gradients for p(n_0|t | n_t) were not provided"
 
-        r_t_squared = self.rt_squared(x, t)[:, None, None, None]
+        r_t_squared = self.rt_squared(x, t)
         q_t_squared = r_t_squared
 
+        while r_t_squared.dim() < x.dim():
+            r_t_squared = r_t_squared.unsqueeze(-1)
+        while q_t_squared.dim() < n.dim():
+            q_t_squared = q_t_squared.unsqueeze(-1)
+
         if self.A is not None:
-            # compressed sensing y = Ax + n
-            m, d = tf.shape(self.A)
-            I = tf.eye(m, m)
+            A = self.A.to(x.device)
+            A_T = self.A_T.to(x.device)
+            m, d = A.shape
+            I = torch.eye(m, device=x.device)
 
-            # flatten x_0t and dx_0t_xt
-            x_mean = tf.reshape(x_mean, (self.batch_size, -1))
-            n_mean = tf.reshape(n_mean, (self.batch_size, -1))
-            grad_x0_xt = tf.reshape(grad_x0_xt, (self.batch_size, -1))
-            grad_n0_nt = tf.reshape(grad_n0_nt, (self.batch_size, -1))
+            x_mean_flat = x_mean.reshape(self.batch_size, -1)
+            n_mean_flat = n_mean.reshape(self.batch_size, -1)
+            grad_x_flat = grad_x0_xt.reshape(self.batch_size, -1)
+            grad_n_flat = grad_n0_nt.reshape(self.batch_size, -1)
 
-            # posterior mean p(x0|xt) = A x_0
-            mu_t = tf.linalg.matmul(x_mean, self.A_T) + n_mean
-            # posterior variance p(x0|xt) = r_t^2^2 A A^T + q_t^2 I
-            sigma_t = r_t_squared * tf.linalg.matmul(self.A, self.A_T) + q_t_squared * I
-            sigma_t_inv = tf.transpose(tf.linalg.inv(sigma_t))
+            mu_t = x_mean_flat @ A_T + n_mean_flat
+            sigma_t = (
+                r_t_squared.reshape(-1, 1, 1) * (A @ A_T).unsqueeze(0)
+                + q_t_squared.reshape(-1, 1, 1) * I.unsqueeze(0)
+            )
+            sigma_t_inv = torch.linalg.inv(sigma_t).transpose(-2, -1)
 
-            # diff = tf.linalg.matmul(sigma_t_inv, tf.transpose(y - mu_t))
-            sigma_inv_A = tf.linalg.matmul(sigma_t_inv, self.A)
+            sigma_inv_A = sigma_t_inv @ A.unsqueeze(0)
 
-            # ∇_xt p(y | x_t, n_t) = A^T inv(sigma_t) * (y - mu_t) * dx_0t_xt
-            grad_p_y_xt = grad_x0_xt * tf.linalg.matmul(y - mu_t, sigma_inv_A)
-            grad_p_y_xt = tf.reshape(grad_p_y_xt, (self.batch_size, *self.image_shape))
+            y_flat = y.reshape(self.batch_size, -1)
+            diff = (y_flat - mu_t)
 
-            # ∇_nt p(y | x_t, n_t) = inv(sigma_t) * (y - mu_t) * dn_0t_nt
-            grad_p_y_nt = grad_n0_nt * tf.linalg.matmul(y - mu_t, sigma_t_inv)
-            grad_p_y_nt = tf.reshape(grad_p_y_nt, (self.batch_size, *self.noise_shape))
+            grad_p_y_xt = grad_x_flat * (diff.unsqueeze(1) @ sigma_inv_A).squeeze(1)
+            grad_p_y_xt = grad_p_y_xt.reshape(self.batch_size, *self.image_shape)
+
+            grad_p_y_nt = grad_n_flat * (diff.unsqueeze(1) @ sigma_t_inv).squeeze(1)
+            grad_p_y_nt = grad_p_y_nt.reshape(self.batch_size, *self.noise_shape)
 
         else:
             # y = beta * x + alpha * n
@@ -161,21 +170,17 @@ class PIGDM(Guidance):
             sigma_t = r_t_squared + q_t_squared
 
             grad_p_y_xt = (
-                -1
-                * grad_x0_xt
+                -1 * grad_x0_xt
                 * (beta**2 * x_mean - beta * y + alpha * beta * n_mean)
                 / sigma_t
             )
             grad_p_y_nt = (
-                -1
-                * grad_n0_nt
+                -1 * grad_n0_nt
                 * (alpha**2 * n_mean - alpha * y + alpha * beta * x_mean)
                 / sigma_t
             )
 
-        # data consistency step for x
         x = x + self.lambda_coeff * grad_p_y_xt * r_t_squared
-        # data consistency step for n
         n = n + self.kappa_coeff * grad_p_y_nt * q_t_squared
 
         return x, n
@@ -183,59 +188,55 @@ class PIGDM(Guidance):
 
 @register_guidance(name="dps")
 class DPS(Guidance):
-    """Diffusion Posterior Sampling
+    """Diffusion Posterior Sampling.
     https://arxiv.org/pdf/2209.14687.pdf
     """
 
     def update_fn(self, y, x, t, x_mean, grad_x0_xt, *args):
         """Compute denoising data consistency step."""
-        # x_t+1 = x_t - grad_x_t||y - x_0t||^2_2
         assert grad_x0_xt is not None, "Gradients for p(x_0|t | x_t) were not provided"
 
-        with tf.GradientTape() as tape:
-            tape.watch(x_mean)
-            if self.A is not None:
-                # compressed sensing y = Ax + n
-                Ax = tf.linalg.matmul(x_mean, self.A_T)
-                norm = tf.linalg.norm((y - Ax))
-            else:
-                norm = tf.linalg.norm((y - x_mean))
+        x_mean_var = x_mean.detach().requires_grad_(True)
+        if self.A is not None:
+            A_T = self.A_T.to(x.device)
+            Ax = x_mean_var.reshape(self.batch_size, -1) @ A_T
+            y_flat = y.reshape(self.batch_size, -1)
+            norm = torch.linalg.norm(y_flat - Ax)
+        else:
+            norm = torch.linalg.norm(y - x_mean_var)
 
-        # chain rule dy_dxt = dy_dx0 * dx0_dxt
-        grad_p_y_xt = -1 * tape.gradient(norm, x_mean) * grad_x0_xt
+        grad_norm = torch.autograd.grad(norm, x_mean_var)[0]
+        grad_p_y_xt = -1 * grad_norm * grad_x0_xt
 
-        # data consistency step for x
         x = x + self.lambda_coeff * grad_p_y_xt
         return x
 
     def joint_denoise_update(self, y, x, n, t, x_mean, n_mean, grad_x0_xt, grad_n0_nt):
         """Compute denoising data consistency step for structured noise."""
-        assert grad_x0_xt is not None, "Gradients for p(x_0|t | x_t) were not provided"
-        assert grad_n0_nt is not None, "Gradients for p(n_0|t | n_t) were not provided"
+        assert grad_x0_xt is not None
+        assert grad_n0_nt is not None
 
-        with tf.GradientTape(persistent=True) as tape:
-            tape.watch(x_mean)
-            tape.watch(n_mean)
-            if self.A is not None:
-                # compressed sensing y = Ax + n
-                _x_mean = tf.reshape(x_mean, (self.batch_size, -1))
-                Ax = tf.linalg.matmul(_x_mean, self.A_T)
-                norm = tf.linalg.norm((y - Ax - n_mean))
-            else:
-                # y = beta * x + alpha * n
-                alpha = self.corruptor.blend_factor
-                beta = 1 - alpha
-                norm = tf.linalg.norm((y - beta * x_mean - alpha * n_mean))
+        x_mean_var = x_mean.detach().requires_grad_(True)
+        n_mean_var = n_mean.detach().requires_grad_(True)
 
-        # chain rule dy_dxt = dy_dx0 * dx0_dxt
-        grad_p_y_xt = -1 * tape.gradient(norm, x_mean) * grad_x0_xt
-        # chain rule dy_dnt = dy_dn0 * dn0_dnt
-        grad_p_y_nt = -1 * tape.gradient(norm, n_mean) * grad_n0_nt
-        del tape
+        if self.A is not None:
+            A_T = self.A_T.to(x.device)
+            x_flat = x_mean_var.reshape(self.batch_size, -1)
+            Ax = x_flat @ A_T
+            y_flat = y.reshape(self.batch_size, -1)
+            norm = torch.linalg.norm(y_flat - Ax - n_mean_var.reshape(self.batch_size, -1))
+        else:
+            alpha = self.corruptor.blend_factor
+            beta = 1 - alpha
+            norm = torch.linalg.norm(y - beta * x_mean_var - alpha * n_mean_var)
 
-        # data consistency step for x
+        grad_x = torch.autograd.grad(norm, x_mean_var, retain_graph=True)[0]
+        grad_n = torch.autograd.grad(norm, n_mean_var)[0]
+
+        grad_p_y_xt = -1 * grad_x * grad_x0_xt
+        grad_p_y_nt = -1 * grad_n * grad_n0_nt
+
         x = x + self.lambda_coeff * grad_p_y_xt
-        # data consistency step for n
         n = n + self.kappa_coeff * grad_p_y_nt
 
         return x, n
@@ -243,78 +244,56 @@ class DPS(Guidance):
 
 @register_guidance(name="projection")
 class Projection(Guidance):
-    """Projection sampling
+    """Projection sampling.
     https://arxiv.org/pdf/2111.08005.pdf
     """
 
     def denoise_update(self, y, x, t, *args):
         """Compute data consistency for compressed sensing task."""
-        y_hat = self.sde.forward_diffuse(y, t)
+        t_batch = t if t.dim() > 0 else t.expand(self.batch_size)
+        y_hat = self.sde.forward_diffuse(y, t_batch)
 
         if self.A is not None:
-            # x_t+1 = x_t - λ * A^T(Ax_t - y_hat)
-            # flatten x
-            _x = tf.reshape(x, (self.batch_size, -1))
+            A = self.A.to(x.device)
+            A_T = self.A_T.to(x.device)
 
-            # A^T (Ax - y)
-            grad_y_hat_xt = tf.transpose(
-                tf.linalg.matmul(
-                    self.A_T,
-                    tf.transpose(tf.linalg.matmul(_x, self.A_T)) - tf.transpose(y),
-                )
-            )
-            # reshape again into image shape size
-            grad_y_hat_xt = -tf.reshape(
-                grad_y_hat_xt, (self.batch_size, *self.image_shape)
-            )
+            x_flat = x.reshape(self.batch_size, -1)
+            y_flat = y.reshape(self.batch_size, -1)
+
+            # A^T(Ax - y)
+            residual = x_flat @ A_T - y_flat
+            grad_y_hat_xt = -(residual @ A).reshape(self.batch_size, *self.image_shape)
         else:
-            # x_t+1 = x_t - λ * (x_t - y_hat)
             grad_y_hat_xt = y_hat - x
 
-        # data consistency step for x
         x = x + self.lambda_coeff * grad_y_hat_xt
         return x
 
     def joint_denoise_update(self, y, x, n, t, *args):
-        """Compute data consistency for denoising for using score models."""
-
-        y_hat = self.sde.forward_diffuse(y, t)
+        """Compute data consistency for denoising using score models."""
+        t_batch = t if t.dim() > 0 else t.expand(self.batch_size)
+        y_hat = self.sde.forward_diffuse(y, t_batch)
 
         if self.A is not None:
-            # flatten x
-            _x = tf.reshape(x, (self.batch_size, -1))
+            A = self.A.to(x.device)
+            A_T = self.A_T.to(x.device)
 
-            # flatten n
-            _n = tf.reshape(n, (self.batch_size, -1))
+            x_flat = x.reshape(self.batch_size, -1)
+            n_flat = n.reshape(self.batch_size, -1)
+            y_flat = y_hat.reshape(self.batch_size, -1)
 
             # (Ax - y_hat + n)
-            grad_y_hat_nt = tf.linalg.matmul(_x, self.A_T) - y_hat + _n
-            # A^T (Ax - y_hat + n)
-            grad_y_hat_xt = tf.transpose(
-                tf.linalg.matmul(
-                    self.A_T,
-                    tf.transpose(grad_y_hat_nt),
-                )
-            )
-
-            # reshape again into image shape size
-            grad_y_hat_xt = -tf.reshape(
-                grad_y_hat_xt, (self.batch_size, *self.image_shape)
-            )
-            grad_y_hat_nt = -tf.reshape(
-                grad_y_hat_nt, (self.batch_size, *self.noise_shape)
-            )
+            residual = x_flat @ A_T - y_flat + n_flat
+            grad_y_hat_xt = -(residual @ A).reshape(self.batch_size, *self.image_shape)
+            grad_y_hat_nt = -residual.reshape(self.batch_size, *self.noise_shape)
         else:
-            # y = beta * x + alpha * n
             alpha = self.corruptor.blend_factor
             beta = 1 - alpha
 
             grad_y_hat_xt = -(beta**2 * x - beta * y_hat + alpha * beta * n)
             grad_y_hat_nt = -(alpha**2 * n - alpha * y_hat + alpha * beta * x)
 
-        # data consistency step for x
         x = x + self.lambda_coeff * grad_y_hat_xt
-        # data consistency step for n
         n = n + self.kappa_coeff * grad_y_hat_nt
 
         return x, n

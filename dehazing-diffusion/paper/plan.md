@@ -480,6 +480,96 @@ score = gcnr(dehazed_region, background_region)
 
 ---
 
+## Port Status & Gap Analysis (2026-01-29)
+
+### What Was Ported (Phase 2 Core SGM Files) [done]
+
+These 6 files were fully rewritten from TensorFlow to PyTorch and pass all sanity tests
+(`joint_diffusion/test_sanity.py` — all 6 test groups PASS):
+
+| File | What It Contains |
+|------|-----------------|
+| `generators/SGM/sde_lib.py` | `SDE`, `VPSDE`, `VESDE`, `subVPSDE`, `simple` — all use `torch.*` |
+| `generators/layers.py` | `ConvBlock`, `ResidualBlock`, `RCUBlock`, `MSFBlock`, `CRPBlock`, `RefineBlock` — all `nn.Module` |
+| `generators/SGM/SGM.py` | `NCSNv2` (backbone) + `ScoreNet` (wrapper with SDE, loss, score computation) |
+| `generators/SGM/sampling.py` | `ScoreSampler`, `EulerMaruyamaPredictor`, `ReverseDiffusionPredictor`, `LangevinCorrector`, `AnnealedLangevinDynamics` |
+| `generators/SGM/guidance.py` | `PIGDM`, `DPS`, `Projection` — gradient-based guidance using `torch.autograd.grad` |
+| `utils/corruptors.py` | `GaussianCorruptor`, `CSCorruptor`, `HazeCorruptor` — pure PyTorch |
+
+Also created:
+- `generators/__init__.py`, `generators/SGM/__init__.py`, `utils/__init__.py`
+- `test_sanity.py` — comprehensive test covering imports, SDEs, layers, NCSNv2, loss+backward, sampling
+
+### What Still Has TensorFlow Dependencies (NOT Ported)
+
+These files still import TensorFlow and will block `train.py` / `inference.py`:
+
+| File | TF? | Needed For | Notes |
+|------|-----|-----------|-------|
+| `generators/models.py` | Yes (`tensorflow_addons`, `keras`) | `train.py`, `inference.py` | `get_model()` factory — orchestrates GAN/Score/Glow/UNet |
+| `utils/callbacks.py` | Yes (Keras `Callback`) | `train.py` | `EvalDataset`, `Monitor` — Keras callback classes |
+| `utils/checkpoints.py` | Yes (hybrid TF+torch) | `train.py`, `inference.py` | `ModelCheckpoint` — handles both frameworks |
+| `utils/inverse.py` | Yes (hybrid TF+torch) | `inference.py` | `get_denoiser()`, `SGMDenoiser` |
+| `utils/signals.py` | Yes (`tfa`) | `datasets.py` (MNIST/CelebA only, **not** ZEA) | `add_gaussian_noise`, `RandomTranslation` |
+| `utils/utils.py` | Yes (hybrid) | Nearly everything | `set_random_seed`, `load_config_from_yaml`, etc. |
+| `utils/gpu_config.py` | Likely TF | `train.py` | GPU config |
+| `datasets.py` | Yes (top-level TF) | `train.py` | Top imports are TF; `ZeaDataset` at bottom is PyTorch |
+| `train.py` | Yes (`keras`, `wandb.keras`) | Training entry point | Uses `model.fit()`, Keras callbacks |
+| `inference.py` | Chains through TF modules | Inference entry point | Uses `get_denoiser`, `get_model` |
+
+### Functions Referenced in plan.md That Don't Exist in the Port
+
+- `get_sde(config)` — plan.md Step 3.2 references this factory function, but it was never in `sde_lib.py`. Use the SDE classes directly (e.g. `VESDE(sigma_min=..., sigma_max=..., N=...)`) or add a factory.
+- `AttrDict` — plan.md uses `from utils.utils import AttrDict`, but the codebase uses `easydict.EasyDict`. Use `easydict.EasyDict` or define a simple `AttrDict` wrapper.
+- `DownSample`, `UpSample` — plan.md Step 3.1 imports these from `generators.layers`, but the PyTorch port doesn't include them (they were TF-only layers for UNet/GAN, not needed for NCSNv2).
+- `NCSNv2(config)(x, t)` — plan.md Step 3.2 calls `model(x, t)`. The ported `NCSNv2` takes only `(x)`. Time conditioning is handled in `ScoreNet.get_score(x, t)` via score division by `std(t)`.
+
+### Next Step: Phase 5 (Training)
+
+`train.py` cannot run as-is because it imports TF-dependent modules. Two options:
+
+**Option A (recommended): Write a minimal PyTorch training script** that bypasses the TF `train.py`:
+
+```bash
+cd /home/tp030/f2f_ldm/dehazing-diffusion/joint_diffusion
+source /home/tp030/f2f_ldm/.venv_joint/bin/activate
+python train_pytorch.py -c configs/training/score_zea_tissue.yaml --data_root ../../data
+```
+
+This script would directly use `ScoreNet` + `ZeaDataset` + a standard PyTorch training loop.
+It needs: config loading (YAML → dict), `ZeaDataset`, `ScoreNet`, `torch.optim.Adam`, checkpointing, and optionally wandb logging.
+
+**Option B: Port the remaining TF files** (`generators/models.py`, `utils/callbacks.py`, `utils/checkpoints.py`, `datasets.py` top-level, `train.py`). This is more work but preserves the original interface.
+
+### How to Know If the Port Is Wrong (Reference Files)
+
+If something produces wrong results, compare against these official PyTorch implementations in `reproduce_helpers/`:
+
+| Ported File | Reference File(s) | What to Check |
+|---|---|---|
+| `generators/SGM/sde_lib.py` | `reproduce_helpers/score_sde_pytorch/sde_lib.py` | Nearly 1:1. Extra: `simple` class and `forward_diffuse` method from TF original. |
+| `generators/layers.py` | `reproduce_helpers/ncsnv2/models/layers.py` | `ResidualBlock`, `RCUBlock`, `MSFBlock`, `CRPBlock`, `RefineBlock` — these are ground truth. |
+| `generators/SGM/SGM.py` (NCSNv2) | `reproduce_helpers/ncsnv2/models/ncsnv2.py` | Official takes `(x, y)` where `y` is discrete sigma index and divides by `sigma[y]`. Port takes `(x)` only; sigma division is in `ScoreNet.get_score()`. This is intentional. |
+| `generators/SGM/SGM.py` (ScoreNet loss) | `reproduce_helpers/score_sde_pytorch/losses.py` → `get_sde_loss_fn()` | Reference for denoising score matching loss. |
+| `generators/SGM/SGM.py` (get_score) | `reproduce_helpers/score_sde_pytorch/models/utils.py` → `get_score_fn()` | Reference for how model output → score. |
+| `generators/SGM/sampling.py` | `reproduce_helpers/score_sde_pytorch/sampling.py` | Official PC sampler, predictors, correctors. |
+| `generators/SGM/guidance.py` | **No reference** — original code by paper authors | Only reference is the TF version in the repo + paper Algorithm 1 (Section 3.2). |
+| `generators/layers.py` (normalization) | `reproduce_helpers/ncsnv2/models/normalization.py` | `InstanceNorm2dPlus`, `VarianceNorm2d`, etc. Port uses standard `nn.InstanceNorm2d`. |
+
+### Specific Things That Could Go Wrong
+
+1. **Shape broadcasting** — `std[:, None, None, None]` assumes `(B, C, H, W)` channel-first. If spatial dims are wrong, check this pattern in `sde_lib.py`, `SGM.py`, `sampling.py`.
+
+2. **Score normalization** — `ScoreNet.get_score()` divides model output by `std`. The `while std.dim() < x.dim(): std = std.unsqueeze(-1)` expansion must match what `score_loss()` does. Both must be consistent.
+
+3. **Gradient computation for PIGDM** — `EulerMaruyamaPredictor.update_fn()` uses `torch.autograd.grad(x_mean, x_input, ...)` to compute `dx_mean/dx`. If PIGDM guidance gives wrong results, check this against the TF `tf.GradientTape` version.
+
+4. **ResidualBlock downsampling** — Uses `ConvMeanPool` (average of 4 offset grids), not strided convolution. Reference: `reproduce_helpers/ncsnv2/models/layers.py:291-313`.
+
+5. **InstanceNorm2d default** — Port uses `nn.InstanceNorm2d` which has `affine=False` by default. The reference `ncsnv2` code also uses `affine=False` for unconditional normalization, so this is correct. If you see scale issues, check here.
+
+---
+
 ## Troubleshooting
 
 ### GPU OOM during ZEA synthesis
