@@ -50,6 +50,7 @@ sgm:
   sampling_method: pc
   predictor: euler_maruyama
   corrector: none
-  guidance: pigdm
+  guidance: companded_projection
   corruptor_run_id: /scrfs/storage/tp030/home/f2f_ldm/dehazing-diffusion/joint_diffusion/wandb/run-20260129_223131-9hjy8gf0/files
   batch_size: 8
+  patch_overlap: 6

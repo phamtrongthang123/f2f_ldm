@@ -242,6 +242,73 @@ class DPS(Guidance):
         return x, n
 
 
+@register_guidance(name="companded_projection")
+class CompandedProjection(Guidance):
+    """Companding-aware projection sampling (Paper Eq. 11).
+
+    Uses mu-law companding nonlinearity for data consistency:
+        loss = ||y_hat_t - C(C^{-1}(x_t) + gamma * C^{-1}(h_t))||^2
+    Gradients are computed via torch.autograd.grad.
+    """
+
+    def __init__(self, sde, corruptor, lambda_coeff=None, kappa_coeff=None, mu=255):
+        super().__init__(sde, corruptor, lambda_coeff, kappa_coeff)
+        self.mu = mu
+
+    @staticmethod
+    def mu_law_compress(x, mu=255):
+        """Mu-law companding compression: C(x) = sign(x) * log1p(mu * |x|) / log1p(mu)"""
+        return torch.sign(x) * torch.log1p(mu * torch.abs(x)) / torch.log1p(torch.tensor(mu, dtype=x.dtype, device=x.device))
+
+    @staticmethod
+    def mu_law_expand(x, mu=255):
+        """Mu-law companding expansion: C^{-1}(x) = sign(x) * ((1 + mu)^|x| - 1) / mu"""
+        return torch.sign(x) * ((1 + mu) ** torch.abs(x) - 1) / mu
+
+    def denoise_update(self, y, x, t, *args):
+        """Single-model data consistency: ||y_hat - x||^2."""
+        t_batch = t if t.dim() > 0 else t.expand(self.batch_size)
+
+        with torch.enable_grad():
+            y_hat = self.sde.forward_diffuse(y, t_batch)
+            x_var = x.detach().requires_grad_(True)
+            loss = torch.sum((y_hat - x_var) ** 2)
+            grad_x = torch.autograd.grad(loss, x_var)[0]
+
+        x = x - self.lambda_coeff * grad_x
+        return x
+
+    def joint_denoise_update(self, y, x, n, t, *args):
+        """Companding-aware joint data consistency (Eq. 11).
+
+        loss = ||y_hat_t - C(C^{-1}(x_t) + gamma * C^{-1}(h_t))||^2
+        """
+        t_batch = t if t.dim() > 0 else t.expand(self.batch_size)
+
+        gamma = self.corruptor.noise_stddev
+        mu = self.mu
+
+        with torch.enable_grad():
+            y_hat = self.sde.forward_diffuse(y, t_batch)
+
+            x_var = x.detach().requires_grad_(True)
+            n_var = n.detach().requires_grad_(True)
+
+            # Expand from companded to RF domain, combine, compress back
+            x_rf = self.mu_law_expand(x_var, mu)
+            h_rf = self.mu_law_expand(n_var, mu)
+            y_pred = self.mu_law_compress(x_rf + gamma * h_rf, mu)
+
+            loss = torch.sum((y_hat - y_pred) ** 2)
+
+            grad_x, grad_n = torch.autograd.grad(loss, [x_var, n_var])
+
+        x = x - self.lambda_coeff * grad_x
+        n = n - self.kappa_coeff * grad_n
+
+        return x, n
+
+
 @register_guidance(name="projection")
 class Projection(Guidance):
     """Projection sampling.

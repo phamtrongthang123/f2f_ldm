@@ -279,6 +279,8 @@ class ScoreSampler:
         start_diffusion: float = None,
         sampling_eps: float = None,
         early_stop: int = None,
+        patch_overlap: int = 0,
+        full_image_shape: tuple = None,
     ):
         assert sampling_method in ["pc", "ode"], f"{sampling_method} is not supported"
 
@@ -307,6 +309,8 @@ class ScoreSampler:
         self.start_diffusion = start_diffusion
         self.eps = sampling_eps if sampling_eps is not None else 1e-3
         self.early_stop = early_stop
+        self.patch_overlap = patch_overlap
+        self.full_image_shape = full_image_shape
         self.guidance = guidance
         self.compute_grad = False
 
@@ -359,6 +363,141 @@ class ScoreSampler:
             )
         return predictor, corrector
 
+    def _extract_patches(self, image, patch_h, patch_w, overlap):
+        """Extract overlapping patches from a full image.
+
+        Args:
+            image: (B, C, H, W) tensor
+            patch_h: patch height
+            patch_w: patch width
+            overlap: number of overlapping pixels
+
+        Returns:
+            patches: (B*N*M, C, patch_h, patch_w) tensor
+            grid_info: dict with grid dimensions and parameters
+        """
+        B, C, H, W = image.shape
+        stride_h = patch_h - overlap
+        stride_w = patch_w - overlap
+
+        # Number of patches in each dimension
+        n_rows = max(1, (H - patch_h) // stride_h + 1)
+        n_cols = max(1, (W - patch_w) // stride_w + 1)
+
+        patches = []
+        for i in range(n_rows):
+            for j in range(n_cols):
+                top = min(i * stride_h, H - patch_h)
+                left = min(j * stride_w, W - patch_w)
+                patch = image[:, :, top:top + patch_h, left:left + patch_w]
+                patches.append(patch)
+
+        patches = torch.cat(patches, dim=0)  # (B*N*M, C, patch_h, patch_w)
+
+        grid_info = {
+            "batch_size": B,
+            "n_rows": n_rows,
+            "n_cols": n_cols,
+            "patch_h": patch_h,
+            "patch_w": patch_w,
+            "overlap": overlap,
+            "stride_h": stride_h,
+            "stride_w": stride_w,
+            "H": H,
+            "W": W,
+        }
+        return patches, grid_info
+
+    def _interleave_patches(self, patches, grid_info):
+        """Copy overlapping pixels from each patch to adjacent patches (Algorithm 1, lines 48-51).
+
+        For each patch (n, m), copy its overlap region to neighbors:
+          (n, m-1), (n-1, m), (n-1, m-1)
+
+        Args:
+            patches: (B*N*M, C, patch_h, patch_w) tensor
+            grid_info: dict from _extract_patches
+
+        Returns:
+            patches: updated tensor with interleaved overlap regions
+        """
+        B = grid_info["batch_size"]
+        n_rows = grid_info["n_rows"]
+        n_cols = grid_info["n_cols"]
+        overlap = grid_info["overlap"]
+        patch_h = grid_info["patch_h"]
+        patch_w = grid_info["patch_w"]
+
+        if overlap <= 0:
+            return patches
+
+        num_patches = n_rows * n_cols
+
+        def idx(b, r, c):
+            """Get flat index for batch b, row r, col c."""
+            return b * num_patches + r * n_cols + c
+
+        for b in range(B):
+            for n in range(n_rows):
+                for m in range(n_cols):
+                    src_idx = idx(b, n, m)
+
+                    # Copy left overlap to (n, m-1)
+                    if m > 0:
+                        dst_idx = idx(b, n, m - 1)
+                        # Left side of src = right side of dst
+                        patches[dst_idx, :, :, patch_w - overlap:] = \
+                            patches[src_idx, :, :, :overlap].clone()
+
+                    # Copy top overlap to (n-1, m)
+                    if n > 0:
+                        dst_idx = idx(b, n - 1, m)
+                        # Top side of src = bottom side of dst
+                        patches[dst_idx, :, patch_h - overlap:, :] = \
+                            patches[src_idx, :, :overlap, :].clone()
+
+                    # Copy top-left corner to (n-1, m-1)
+                    if n > 0 and m > 0:
+                        dst_idx = idx(b, n - 1, m - 1)
+                        patches[dst_idx, :, patch_h - overlap:, patch_w - overlap:] = \
+                            patches[src_idx, :, :overlap, :overlap].clone()
+
+        return patches
+
+    def _stitch_patches(self, patches, grid_info):
+        """Reassemble patches into full image. Last-write-wins for overlap regions.
+
+        Args:
+            patches: (B*N*M, C, patch_h, patch_w) tensor
+            grid_info: dict from _extract_patches
+
+        Returns:
+            image: (B, C, H, W) tensor
+        """
+        B = grid_info["batch_size"]
+        n_rows = grid_info["n_rows"]
+        n_cols = grid_info["n_cols"]
+        patch_h = grid_info["patch_h"]
+        patch_w = grid_info["patch_w"]
+        H = grid_info["H"]
+        W = grid_info["W"]
+        stride_h = grid_info["stride_h"]
+        stride_w = grid_info["stride_w"]
+        num_patches = n_rows * n_cols
+
+        C = patches.shape[1]
+        image = torch.zeros(B, C, H, W, device=patches.device, dtype=patches.dtype)
+
+        for b in range(B):
+            for i in range(n_rows):
+                for j in range(n_cols):
+                    p_idx = b * num_patches + i * n_cols + j
+                    top = min(i * stride_h, H - patch_h)
+                    left = min(j * stride_w, W - patch_w)
+                    image[b, :, top:top + patch_h, left:left + patch_w] = patches[p_idx]
+
+        return image
+
     def __call__(self, y=None, **kwargs):
         if y is None:
             x = self._sample(**kwargs)
@@ -382,7 +521,7 @@ class ScoreSampler:
 
     def pc_sampler(self, y=None, z=None, shape=None, progress_bar=True):
         """The PC sampler function.
-        
+
         Note: @torch.no_grad() removed to allow gradient computation for PIGDM/DPS guidance.
 
         Args:
@@ -395,6 +534,7 @@ class ScoreSampler:
             samples (and noise estimates for joint inference).
         """
         device = next(self.model.parameters()).device
+        use_patches = self.patch_overlap > 0 and self.full_image_shape is not None
 
         # Initialize
         if y is None:
@@ -412,7 +552,6 @@ class ScoreSampler:
 
             if self.noise_model is not None:
                 noise_shape = (self.batch_size, *self.noise_shape)
-                n = self.sde.prior_sampling(noise_shape).to(device)
                 self.guidance.noise_shape = self.noise_shape
 
             if (self.start_diffusion is not None) and self.start_diffusion > 0:
@@ -424,10 +563,38 @@ class ScoreSampler:
             else:
                 x = self.sde.prior_sampling(shape).to(device)
 
+        # Patch extraction (Algorithm 1)
+        grid_info = None
+        if use_patches and y is not None:
+            patch_h, patch_w = self.image_shape[-2], self.image_shape[-1]
+            y_patches, grid_info = self._extract_patches(
+                y, patch_h, patch_w, self.patch_overlap
+            )
+            x_patches, _ = self._extract_patches(
+                x, patch_h, patch_w, self.patch_overlap
+            )
+            if self.noise_model is not None:
+                # Initialize noise at full image size, then extract patches
+                n_full_shape = (self.batch_size, self.noise_shape[0], y.shape[2], y.shape[3])
+                n_full = self.sde.prior_sampling(n_full_shape).to(device)
+                n_patches, _ = self._extract_patches(
+                    n_full, patch_h, patch_w, self.patch_overlap
+                )
+            # Update batch size to number of total patches
+            total_patches = x_patches.shape[0]
+            self.batch_size = total_patches
+            self.guidance.batch_size = total_patches
+            x = x_patches
+            y = y_patches
+            if self.noise_model is not None:
+                n = n_patches
+        elif self.noise_model is not None and y is not None:
+            n = self.sde.prior_sampling(noise_shape).to(device)
+
         # Tracking
         if self.keep_track:
             x_list = [x.clone()]
-            if self.noise_model:
+            if self.noise_model and y is not None:
                 n_list = [n.clone()]
 
         # Diffusion timeline
@@ -473,16 +640,32 @@ class ScoreSampler:
                         y, x, vec_t, x_mean, self.predictor.grad_x0_xt
                     )
 
+            # Patch interleaving (Algorithm 1, lines 47-51)
+            if grid_info is not None:
+                x = self._interleave_patches(x, grid_info)
+                if self.noise_model is not None and y is not None:
+                    n = self._interleave_patches(n, grid_info)
+
             if self.keep_track:
                 x_list.append(x_mean.clone())
-                if self.noise_model:
+                if self.noise_model and y is not None:
                     n_list.append(n_mean.clone())
 
             if torch.isnan(x.sum()):
                 warnings.warn("NaN in intermediate solution, breaking out...")
                 break
 
-        if self.noise_model:
+        # Stitch patches back together
+        if grid_info is not None:
+            x_mean = self._stitch_patches(x_mean, grid_info)
+            if self.noise_model and y is not None:
+                n_mean = self._stitch_patches(n_mean, grid_info)
+            if self.keep_track:
+                x_list = [self._stitch_patches(xi, grid_info) for xi in x_list]
+                if self.noise_model and y is not None:
+                    n_list = [self._stitch_patches(ni, grid_info) for ni in n_list]
+
+        if self.noise_model and y is not None:
             return (
                 x_list if self.keep_track else x_mean,
                 n_list if self.keep_track else n_mean,

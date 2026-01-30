@@ -577,6 +577,8 @@ class SGMDenoiser(Denoiser):
             start_diffusion=self.config.get("ccdf"),
             sampling_eps=self.config.get("sampling_eps"),
             early_stop=self.config.get("early_stop"),
+            patch_overlap=self.config.get("patch_overlap", 0),
+            full_image_shape=tuple(self.config.image_shape) if self.config.get("patch_overlap", 0) > 0 else None,
         )
 
     @timefunc
