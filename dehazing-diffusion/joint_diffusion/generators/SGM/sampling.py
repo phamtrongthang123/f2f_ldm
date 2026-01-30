@@ -119,15 +119,18 @@ class EulerMaruyamaPredictor(Predictor):
 
         if self.compute_grad:
             # Enable gradient tracking for PIGDM / DPS guidance
-            x_input = x.detach().requires_grad_(True)
-            drift, diffusion = self.rsde.sde(x_input, t)
-            x_mean = x_input + drift * dt
-            # Compute dx_mean/dx for guidance
-            self.grad_x0_xt = torch.autograd.grad(
-                x_mean, x_input, grad_outputs=torch.ones_like(x_mean),
-                create_graph=False,
-            )[0]
+            # Use torch.enable_grad() to ensure gradients are computed even in no_grad context
+            with torch.enable_grad():
+                x_input = x.detach().requires_grad_(True)
+                drift, diffusion = self.rsde.sde(x_input, t)
+                x_mean = x_input + drift * dt
+                # Compute dx_mean/dx for guidance
+                self.grad_x0_xt = torch.autograd.grad(
+                    x_mean, x_input, grad_outputs=torch.ones_like(x_mean),
+                    create_graph=False,
+                )[0]
             x_mean = x_mean.detach()
+            diffusion = diffusion.detach() if isinstance(diffusion, torch.Tensor) else diffusion
         else:
             drift, diffusion = self.rsde.sde(x, t)
             x_mean = x + drift * dt
@@ -377,9 +380,10 @@ class ScoreSampler:
             raise NotImplementedError("ODE not supported")
         return x
 
-    @torch.no_grad()
     def pc_sampler(self, y=None, z=None, shape=None, progress_bar=True):
         """The PC sampler function.
+        
+        Note: @torch.no_grad() removed to allow gradient computation for PIGDM/DPS guidance.
 
         Args:
             y: measurement for conditional sampling. None = unconditional.

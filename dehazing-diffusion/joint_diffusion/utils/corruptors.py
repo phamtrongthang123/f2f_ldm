@@ -2,6 +2,7 @@
 Author(s): Tristan Stevens
 """
 import abc
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -100,20 +101,55 @@ class HazeCorruptor(Corruptor):
 
     def __init__(self, config, **kwargs):
         super().__init__(config, task="dehazing", **kwargs)
-        self.noise_stddev = getattr(config, "noise_stddev", 0.0)
+        self.noise_stddev = getattr(config, "noise_stddev", 0.5)
         self.blend_factor = getattr(config, "blend_factor", 1.0)
+        self._haze_data = None
+        self._haze_idx = 0
+        
+        # Try to load haze dataset for inference mode
+        data_root = getattr(config, "data_root", None)
+        if data_root:
+            haze_path = Path(data_root) / "zea_synth" / "haze" / "val.npz"
+            if haze_path.exists():
+                import numpy as np
+                npz_key = getattr(config, "npz_key", "rf")
+                self._haze_data = np.load(haze_path)[npz_key]
+                # Ensure channel-first format (N, C, H, W)
+                if self._haze_data.ndim == 3:
+                    self._haze_data = self._haze_data[:, np.newaxis, :, :]
+                print(f"Loaded haze data from {haze_path}: shape {self._haze_data.shape}")
 
-    def corrupt(self, tissue, haze):
-        """Create hazy measurement: y = (1-alpha)*tissue + alpha*haze.
+    def corrupt(self, tissue, haze=None):
+        """Create hazy measurement: y = tissue + noise_stddev * haze.
 
         Args:
             tissue: clean tissue RF data (B, C, H, W)
-            haze: haze RF data (B, C, H, W)
+            haze: haze RF data (B, C, H, W). If None, samples from loaded haze dataset.
 
         Returns:
             y: hazy measurement
         """
-        alpha = self.blend_factor
-        y = (1 - alpha) * tissue + alpha * haze
+        import numpy as np
+        
+        # If haze not provided, sample from loaded haze dataset
+        if haze is None:
+            if self._haze_data is None:
+                raise ValueError(
+                    "HazeCorruptor requires haze data. Either provide haze argument "
+                    "or ensure data_root config points to zea_synth with haze/val.npz"
+                )
+            # Get batch size
+            batch_size = tissue.shape[0]
+            
+            # Sample haze (cycle through if needed)
+            haze_indices = np.arange(self._haze_idx, self._haze_idx + batch_size) % len(self._haze_data)
+            self._haze_idx = (self._haze_idx + batch_size) % len(self._haze_data)
+            
+            haze = self._haze_data[haze_indices]
+            haze = torch.from_numpy(haze).to(tissue.device).float()
+        
+        # Additive haze model: y = tissue + gamma * haze
+        gamma = self.noise_stddev
+        y = tissue + gamma * haze
         self.noise = haze
         return y

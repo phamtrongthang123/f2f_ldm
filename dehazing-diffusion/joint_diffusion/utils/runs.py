@@ -144,13 +144,38 @@ def init_config(run_id=None, update_config=None, just_dataset=False, verbose=Tru
             config["log_dir"] = Path(run.dir) / "files"
         else:
             run = Path(run_id)
-            config_file = list(run.glob("*.yaml"))
-            if len(config_file) != 1:
-                raise ValueError(
-                    "Folder can / should only contain a " "single .yaml config file"
-                )
-            with open(config_file[0]) as yml:
+            # Prefer config_flat.yaml (converted from wandb), fallback to config.yaml
+            config_flat = run / "config_flat.yaml"
+            config_orig = run / "config.yaml"
+            
+            if config_flat.exists():
+                config_file = config_flat
+            elif config_orig.exists():
+                config_file = config_orig
+            else:
+                yaml_files = list(run.glob("*.yaml"))
+                if len(yaml_files) != 1:
+                    raise ValueError(
+                        f"Could not find config file in {run}. "
+                        "Expected config_flat.yaml, config.yaml, or exactly one .yaml file."
+                    )
+                config_file = yaml_files[0]
+            
+            with open(config_file) as yml:
                 config = yaml.load(yml, Loader=yaml.FullLoader)
+            
+            # Handle wandb nested format (key: {value: actual_value})
+            if any(isinstance(v, dict) and "value" in v for k, v in config.items() if not k.startswith("_")):
+                flat_config = {}
+                for key, val in config.items():
+                    if key.startswith("_"):
+                        continue  # Skip wandb internal keys
+                    if isinstance(val, dict) and "value" in val:
+                        flat_config[key] = val["value"]
+                    else:
+                        flat_config[key] = val
+                config = flat_config
+            
             config["log_dir"] = run
 
         if update_config:

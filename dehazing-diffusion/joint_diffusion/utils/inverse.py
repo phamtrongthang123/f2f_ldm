@@ -341,6 +341,83 @@ class Denoiser(abc.ABC):
         fig.savefig(path, dpi=dpi, bbox_inches="tight")
         print(f"Saved plot to {path}")
 
+    def animate(self, duration=5, dpi=150, save=True):
+        """Create animation from denoising history.
+        
+        Args:
+            duration: Duration of animation in seconds
+            dpi: Figure DPI
+            save: Whether to save the animation
+        
+        Returns:
+            matplotlib animation or None
+        """
+        if not self.keep_track:
+            print("No history tracked, skipping animation")
+            return None
+        
+        denoised = self.denoised_samples
+        if not isinstance(denoised, list):
+            print("No history available for animation")
+            return None
+        
+        # Handle joint output
+        if isinstance(denoised[0], tuple):
+            denoised = [d[0] for d in denoised]
+        
+        num_frames = len(denoised)
+        if num_frames < 2:
+            print("Not enough frames for animation")
+            return None
+        
+        try:
+            from matplotlib.animation import FuncAnimation
+            
+            # Convert to numpy helper
+            def to_numpy(x):
+                if isinstance(x, torch.Tensor):
+                    x = x.detach().cpu().numpy()
+                if x.ndim == 4 and x.shape[1] in [1, 3]:
+                    x = x.transpose(0, 2, 3, 1)
+                return np.clip(x, self.vmin, self.vmax)
+            
+            # Setup figure
+            num_img = min(4, len(to_numpy(denoised[0])))
+            fig, axs = plt.subplots(1, num_img, figsize=(num_img * 3, 3))
+            if num_img == 1:
+                axs = [axs]
+            
+            # Initialize images
+            frame0 = to_numpy(denoised[0])
+            ims = []
+            for n in range(num_img):
+                img = np.squeeze(frame0[n])
+                im = axs[n].imshow(img, cmap="gray", vmin=self.vmin, vmax=self.vmax)
+                axs[n].axis("off")
+                ims.append(im)
+            
+            def update(frame_idx):
+                frame = to_numpy(denoised[frame_idx])
+                for n in range(num_img):
+                    img = np.squeeze(frame[n])
+                    ims[n].set_array(img)
+                return ims
+            
+            interval = (duration * 1000) / num_frames
+            anim = FuncAnimation(fig, update, frames=num_frames, interval=interval, blit=True)
+            
+            if save:
+                filename = f"{self.name.lower()}_{self.config.dataset_name}_{self.corruptor.task}_animation"
+                path = get_date_filename(f"figures/{filename}.gif")
+                anim.save(path, writer="pillow", fps=num_frames / duration, dpi=dpi)
+                print(f"Saved animation to {path}")
+            
+            plt.close(fig)
+            return anim
+        except Exception as e:
+            print(f"Could not create animation: {e}")
+            return None
+
 
 @register_denoiser(name="none")
 class NoneDenoiser(Denoiser):
@@ -396,8 +473,52 @@ class SGMDenoiser(Denoiser):
         ckpt = ModelCheckpoint(self.model, config=self.config)
         ckpt.restore(self.config.get("checkpoint_file"))
 
+        # Load corruptor model for joint inference (e.g., haze model for dehazing)
+        self._load_corruptor_model()
+
         # Setup sampler
         self.set_sampler()
+
+    def _load_corruptor_model(self):
+        """Load corruptor noise model from corruptor_run_id if specified."""
+        from utils.runs import init_config
+        
+        corruptor_run_id = self.config.get("corruptor_run_id")
+        if corruptor_run_id is None:
+            return
+        
+        print(f"Loading corruptor model from: {corruptor_run_id}")
+        
+        # Load corruptor model config
+        corr_config = init_config(corruptor_run_id, just_dataset=False, verbose=False)
+        
+        # Handle image_size vs image_shape naming inconsistency
+        if "image_size" in corr_config and "image_shape" not in corr_config:
+            # image_size is [H, W], image_shape should be [C, H, W]
+            img_size = corr_config.image_size
+            # For ZEA datasets, get channels from the main model's image_shape
+            # (both tissue and haze have same number of transmits)
+            if hasattr(self.config, 'image_shape'):
+                channels = self.config.image_shape[0]
+            else:
+                color_mode = corr_config.get("color_mode", "grayscale")
+                channels = 1 if color_mode == "grayscale" else 3
+            corr_config.image_shape = [channels, *img_size]
+        
+        # Build and load the corruptor model
+        noise_model = get_model(corr_config, training=False)
+        noise_model = noise_model.to(self.device)
+        noise_model.eval()
+        
+        # Load checkpoint
+        corr_ckpt = ModelCheckpoint(noise_model, config=corr_config)
+        corr_ckpt.restore()
+        
+        # Attach to corruptor
+        self.corruptor.model = noise_model
+        self.corruptor.image_shape = corr_config.image_shape
+        
+        print(f"Loaded corruptor model: {type(noise_model).__name__}")
 
     def set_sampler(self):
         """Initialize the score sampler."""
@@ -648,3 +769,99 @@ def plot_multiple_denoisers(denoisers, dpi=300, show_metrics=True, save=True, fi
         print(f"Saved comparison plot to {path}")
 
     return fig
+
+
+def animate_multiple_denoisers(denoisers, duration=5, dpi=150, save=True):
+    """Create animation from denoising history of multiple denoisers.
+    
+    Args:
+        denoisers: List of Denoiser objects (already run with keep_track=True)
+        duration: Duration of animation in seconds
+        dpi: Figure DPI
+        save: Whether to save the animation
+    
+    Returns:
+        matplotlib animation or None if animation not possible
+    """
+    from matplotlib.animation import FuncAnimation
+    
+    if not denoisers:
+        return None
+    
+    # Find denoisers with history
+    denoisers_with_history = [d for d in denoisers if d.keep_track and hasattr(d, 'denoised_samples')]
+    if not denoisers_with_history:
+        print("No denoisers with tracked history, skipping animation")
+        return None
+    
+    denoiser = denoisers_with_history[0]
+    
+    # Get history from first denoiser with tracking
+    history = denoiser.denoised_samples
+    if not isinstance(history, list):
+        print("No history available for animation")
+        return None
+    
+    num_frames = len(history)
+    if num_frames < 2:
+        print("Not enough frames for animation")
+        return None
+    
+    # Convert to numpy helper
+    def to_numpy(x):
+        if isinstance(x, torch.Tensor):
+            x = x.detach().cpu().numpy()
+        if x.ndim == 4 and x.shape[1] in [1, 3]:
+            x = x.transpose(0, 2, 3, 1)
+        return np.clip(x, denoiser.vmin, denoiser.vmax)
+    
+    # Setup figure
+    num_img = min(4, len(to_numpy(history[0])))  # Limit to 4 images for animation
+    n_cols = len(denoisers_with_history)
+    
+    fig, axs = plt.subplots(num_img, n_cols, figsize=(n_cols * 3, num_img * 3))
+    if num_img == 1 and n_cols == 1:
+        axs = np.array([[axs]])
+    elif num_img == 1:
+        axs = axs.reshape(1, -1)
+    elif n_cols == 1:
+        axs = axs.reshape(-1, 1)
+    
+    # Initialize images
+    ims = []
+    for d_idx, d in enumerate(denoisers_with_history):
+        d_history = d.denoised_samples if isinstance(d.denoised_samples, list) else [d.denoised_samples]
+        frame0 = to_numpy(d_history[0])
+        row_ims = []
+        for n in range(num_img):
+            img = np.squeeze(frame0[n])
+            im = axs[n, d_idx].imshow(img, cmap="gray", vmin=denoiser.vmin, vmax=denoiser.vmax)
+            axs[n, d_idx].axis("off")
+            if n == 0:
+                axs[n, d_idx].set_title(_MODEL_NAMES.get(d.name, d.name))
+            row_ims.append(im)
+        ims.append(row_ims)
+    
+    def update(frame_idx):
+        for d_idx, d in enumerate(denoisers_with_history):
+            d_history = d.denoised_samples if isinstance(d.denoised_samples, list) else [d.denoised_samples]
+            # Handle different history lengths
+            f_idx = min(frame_idx, len(d_history) - 1)
+            frame = to_numpy(d_history[f_idx])
+            for n in range(num_img):
+                img = np.squeeze(frame[n])
+                ims[d_idx][n].set_array(img)
+        return [im for row in ims for im in row]
+    
+    interval = (duration * 1000) / num_frames  # milliseconds per frame
+    anim = FuncAnimation(fig, update, frames=num_frames, interval=interval, blit=True)
+    
+    if save:
+        names = "-".join([d.name for d in denoisers_with_history])
+        filename = f"{names}_{denoiser.config.dataset_name}_{denoiser.corruptor.task}_animation"
+        path = get_date_filename(f"figures/{filename}.gif")
+        anim.save(path, writer="pillow", fps=num_frames / duration, dpi=dpi)
+        print(f"Saved animation to {path}")
+    
+    plt.close(fig)
+    return anim

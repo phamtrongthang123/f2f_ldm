@@ -49,7 +49,7 @@ class Guidance(abc.ABC):
 
     def update_fn(self, y, x, t, x_mean, grad_x0_xt=None):
         """One update for guidance."""
-        if self.corruptor.name in ["gaussian", "mnist", "cs", "cs_sine"]:
+        if self.corruptor.name in ["gaussian", "mnist", "cs", "cs_sine", "haze"]:
             x = self.denoise_update(y, x, t, x_mean, grad_x0_xt)
         else:
             raise ValueError(f"Unknown corruptor: {self.corruptor.name}")
@@ -57,7 +57,7 @@ class Guidance(abc.ABC):
 
     def joint_update_fn(self, y, x, n, t, x_mean, n_mean, grad_x0_xt, grad_n0_nt):
         """One update for joint guidance."""
-        if self.corruptor.name in ["gaussian", "mnist", "cs", "cs_sine"]:
+        if self.corruptor.name in ["gaussian", "mnist", "cs", "cs_sine", "haze"]:
             x, n = self.joint_denoise_update(
                 y, x, n, t, x_mean, n_mean, grad_x0_xt, grad_n0_nt
             )
