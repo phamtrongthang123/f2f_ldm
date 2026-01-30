@@ -268,11 +268,18 @@ class CompandedProjection(Guidance):
     def denoise_update(self, y, x, t, *args):
         """Single-model data consistency: ||y_hat - x||^2."""
         t_batch = t if t.dim() > 0 else t.expand(self.batch_size)
+        mu = self.mu
 
         with torch.enable_grad():
             y_hat = self.sde.forward_diffuse(y, t_batch)
             x_var = x.detach().requires_grad_(True)
-            loss = torch.sum((y_hat - x_var) ** 2)
+
+            # Clamp to C^{-1} domain [-1, 1] (paper Eq 220)
+            x_clamped = x_var.clamp(-1, 1)
+            x_rf = self.mu_law_expand(x_clamped, mu)
+            x_pred = self.mu_law_compress(x_rf, mu)
+
+            loss = torch.sum((y_hat - x_pred) ** 2)
             grad_x = torch.autograd.grad(loss, x_var)[0]
 
         x = x - self.lambda_coeff * grad_x
@@ -294,9 +301,13 @@ class CompandedProjection(Guidance):
             x_var = x.detach().requires_grad_(True)
             n_var = n.detach().requires_grad_(True)
 
+            # Clamp to C^{-1} domain [-1, 1] (paper Eq 220)
+            x_clamped = x_var.clamp(-1, 1)
+            n_clamped = n_var.clamp(-1, 1)
+
             # Expand from companded to RF domain, combine, compress back
-            x_rf = self.mu_law_expand(x_var, mu)
-            h_rf = self.mu_law_expand(n_var, mu)
+            x_rf = self.mu_law_expand(x_clamped, mu)
+            h_rf = self.mu_law_expand(n_clamped, mu)
             y_pred = self.mu_law_compress(x_rf + gamma * h_rf, mu)
 
             loss = torch.sum((y_hat - y_pred) ** 2)

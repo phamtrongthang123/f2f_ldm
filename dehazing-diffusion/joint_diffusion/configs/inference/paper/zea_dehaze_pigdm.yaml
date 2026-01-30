@@ -41,6 +41,7 @@ models:
   - sgm
 
 sgm:
+  ccdf: 0.8
   lambda_coeff: 0.5
   kappa_coeff: 0.5
   # number of noise scales (i.e. time steps in SDE)

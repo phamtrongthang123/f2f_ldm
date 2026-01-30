@@ -97,7 +97,7 @@ image_size:
   value: [1024, 64]
 image_range:
   desc: Tuple with range of input image neural network.
-  value: [0, 1]
+  value: [-1, 1]
 color_mode:
   desc: Either grayscale (1 channel) or rgb (3 channels).
   value: grayscale
