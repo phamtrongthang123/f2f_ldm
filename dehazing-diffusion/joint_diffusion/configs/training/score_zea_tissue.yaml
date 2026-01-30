@@ -37,6 +37,9 @@ sde:
 sigma:
   desc: Sigma value in SDE
   value: 25.0
+num_scales:
+  desc: sde property
+  value: 1000
 reduce_mean:
   desc: reduction type of loss function
   value: false

@@ -67,20 +67,24 @@ See **Port Status & Gap Analysis** section below for full details.
 > **Requires**: ZEA data from Phase 4
 
 **Scripts:**
-- `joint_diffusion/slurm_train.sh` — SLURM wrapper for training
-- `joint_diffusion/train_run.sh` — Inner script (edit to switch between tissue/haze config)
+- `joint_diffusion/slurm_train_tissue.sh` — SLURM wrapper for tissue model
+- `joint_diffusion/slurm_train_haze.sh` — SLURM wrapper for haze model
 - `joint_diffusion/train.py` — Main training script
 
 **Configs:**
 - `configs/training/score_zea_tissue.yaml` — Tissue model (100 epochs, bs=8, lr=1e-4)
 - `configs/training/score_zea_haze.yaml` — Haze model (same params)
 
-**To train tissue model:**
+**To train both models:**
 ```bash
-sbatch joint_diffusion/slurm_train.sh
-```
+cd /scrfs/storage/tp030/home/f2f_ldm/dehazing-diffusion/joint_diffusion
 
-**To train haze model:** Edit `train_run.sh` to use `score_zea_haze.yaml`, then `sbatch`.
+# Train tissue model
+sbatch slurm_train_tissue.sh
+
+# Train haze model (can run in parallel if GPU quota allows)
+sbatch slurm_train_haze.sh
+```
 
 **Checkpoints:** Saved to `wandb/<run_id>/files/training_checkpoints/ckpt-<epoch>.pt`
 
@@ -157,7 +161,8 @@ All files that previously imported TensorFlow have been rewritten. The following
 **New files created:**
 - `test_sanity.py` — Tests imports, SDEs, layers, NCSNv2, loss+backward, sampling (6 test groups)
 - `test_training_loop.py` — Tests full training pipeline with synthetic data
-- `slurm_train.sh` + `train_run.sh` — SLURM job scripts for training
+- `slurm_train_tissue.sh` — SLURM job script for training tissue model
+- `slurm_train_haze.sh` — SLURM job script for training haze model
 - `slurm_test.sh` + `test_run.sh` — SLURM job scripts for testing
 
 ---
@@ -363,10 +368,13 @@ These were intentional choices during porting:
 
 3. **Train tissue model** (requires ZEA data):
    ```bash
-   sbatch slurm_train.sh
+   sbatch slurm_train_tissue.sh
    ```
 
-4. **Train haze model** (edit `train_run.sh` to use `score_zea_haze.yaml`)
+4. **Train haze model** (can run in parallel with tissue):
+   ```bash
+   sbatch slurm_train_haze.sh
+   ```
 
 ---
 
