@@ -6,6 +6,8 @@
 
 **Secondary Goal**: Reproduce the results from the paper "Dehazing Ultrasound using Diffusion Models" (IEEE TMI 2024) using synthetic data generated with ZEA. /home/tp030/f2f_ldm/dehazing-diffusion/paper
 
+DO NOT RUN any training or inference yet. Focus solely on porting the code and ensuring it can be imported and basic operations run without errors and sanity tests ready to verify correctness.
+
 ## Paper Summary
 
 **Title**: Dehazing Ultrasound using Diffusion Models  
@@ -514,7 +516,7 @@ Show B-mode images:
 
 ---
 
-## Checklist: Full Paper Reproduction
+## Checklist: Full Paper Reproduction with sanity test
 
 ### Code Porting
 - [ ] `generators/layers.py` - PyTorch layers
