@@ -5,7 +5,7 @@ Converts raw RF data to B-mode images using the ZEA beamforming pipeline
 """
 
 import os
-os.environ.setdefault("KERAS_BACKEND", "jax")
+os.environ.setdefault("KERAS_BACKEND", "torch")
 os.environ.setdefault("ZEA_DISABLE_CACHE", "1")
 
 import numpy as np
