@@ -62,7 +62,7 @@ See **Port Status & Gap Analysis** section below for full details.
 
 ---
 
-## Phase 5: Train Diffusion Models
+## Phase 5: Train Diffusion Models [done]
 
 > **Requires**: ZEA data from Phase 4
 
@@ -88,27 +88,62 @@ sbatch slurm_train_haze.sh
 
 **Checkpoints:** Saved to `wandb/<run_id>/files/training_checkpoints/ckpt-<epoch>.pt`
 
+**Training Results (2026-01-29):**
+- Tissue model: `wandb/run-20260129_222736-6mpeb46i/files/training_checkpoints/ckpt-99.pt`
+- Haze model: `wandb/run-20260129_223131-9hjy8gf0/files/training_checkpoints/ckpt-99.pt`
+- Both trained for 100 epochs on A100
+- Final loss: ~5k (tissue), similar for haze
+- Training time: ~25 min each
+
+**Fixes required during training:**
+1. Added `num_scales: 1000` to training configs (was missing)
+2. Switched to `opencv-python-headless` (Qt libs unavailable on compute nodes)
+
 ---
 
-## Phase 6: Run Joint Inference
+## Phase 6: Run Joint Inference [done]
 
 ### Step 6.1: Update inference config with trained model paths
 
+Edit `configs/inference/paper/zea_dehaze_pigdm.yaml`:
+```yaml
+data_root: /scrfs/storage/tp030/home/f2f_ldm/data
+run_id:
+  sgm: /path/to/wandb/run-.../files  # tissue model folder
+sgm:
+  corruptor_run_id: /path/to/wandb/run-.../files  # haze model folder
+```
+
+Or use the helper script:
 ```bash
-cd /home/tp030/f2f_ldm
-source .venv_joint/bin/activate
-python reproduce_helpers/update_zea_inference_config.py \
-  --wandb-dir dehazing-diffusion/joint_diffusion/wandb \
-  --inference-config dehazing-diffusion/joint_diffusion/configs/inference/paper/zea_dehaze_pigdm.yaml
+python joint_diffusion/convert_wandb_config.py wandb/run-.../files/config.yaml
 ```
 
 ### Step 6.2: Run dehazing inference
 
 ```bash
 cd dehazing-diffusion/joint_diffusion
-python inference.py -e paper/zea_dehaze_pigdm -t denoise -m sgm \
-  --data_root ../../data
+sbatch slurm_inference_zea.sh
 ```
+
+Or interactively:
+```bash
+python inference.py -e paper/zea_dehaze_pigdm -t denoise
+```
+
+**Inference Results (2026-01-29):**
+- Output: `figures/2026_01_29_sgm_zea_tissue_dehazing_0.png`
+- 200 sampling steps completed in ~19 seconds on A100
+- Joint posterior sampling with PIGDM guidance
+
+**Fixes required for inference:**
+1. Created `convert_wandb_config.py` to flatten wandb config format
+2. Modified `utils/runs.py` to handle both flat and nested config formats
+3. Added `torch.enable_grad()` context in predictor for PIGDM gradient computation
+4. Added "haze" to supported corruptors in `generators/SGM/guidance.py`
+5. Added `_load_corruptor_model()` to `SGMDenoiser` for loading haze prior
+6. Fixed `image_shape` inference for ZEA multi-transmit data (3 channels, not 1)
+7. Added `animate()` method to Denoiser class
 
 ---
 
@@ -163,7 +198,9 @@ All files that previously imported TensorFlow have been rewritten. The following
 - `test_training_loop.py` — Tests full training pipeline with synthetic data
 - `slurm_train_tissue.sh` — SLURM job script for training tissue model
 - `slurm_train_haze.sh` — SLURM job script for training haze model
+- `slurm_inference_zea.sh` — SLURM job script for joint dehazing inference
 - `slurm_test.sh` + `test_run.sh` — SLURM job scripts for testing
+- `convert_wandb_config.py` — Converts wandb nested config to flat format
 
 ---
 
@@ -245,18 +282,24 @@ ema.apply_shadow(model)  # Apply EMA weights before sampling
 ---
 
 #### 4. PIGDM Guidance Not Working
-**Symptom**: Guided sampling produces same result as unconditional
+**Symptom**: Guided sampling produces same result as unconditional, or `RuntimeError: element 0 of tensors does not require grad`
 
 **Cause**: Gradient not flowing through guidance computation
 
 **Where to look**:
 - `generators/SGM/guidance.py` line 45-80: `PIGDM.guide()` uses `torch.autograd.grad`
-- `generators/SGM/sampling.py` line 150-180: Predictor must have `requires_grad=True` on input
+- `generators/SGM/sampling.py` line 120-130: Predictor's `update_fn` with `compute_grad=True`
 
-**Fix**: Ensure `x` has gradients enabled:
+**Fix**: Wrap gradient computation in `torch.enable_grad()` context:
 ```python
-x = x.requires_grad_(True)
+with torch.enable_grad():
+    x_input = x.detach().requires_grad_(True)
+    drift, diffusion = self.rsde.sde(x_input, t)
+    x_mean = x_input + drift * dt
+    self.grad_x0_xt = torch.autograd.grad(x_mean, x_input, ...)[0]
 ```
+
+**Note**: The `@torch.no_grad()` decorator was removed from `pc_sampler` to allow gradient computation.
 
 ---
 
@@ -281,7 +324,39 @@ else:
 
 ---
 
-#### 6. SLURM Job Fails Silently
+#### 6. HazeCorruptor Missing Haze Data or Model
+**Symptom**: `TypeError: HazeCorruptor.corrupt() missing 1 required positional argument: 'haze'`
+
+**Cause**: HazeCorruptor needs either:
+- Haze data loaded from `data/zea_synth/haze/val.npz`, OR
+- Both `tissue` and `haze` arguments passed to `corrupt()`
+
+**Where to look**:
+- `utils/corruptors.py` line 100-150: `HazeCorruptor.__init__` and `corrupt()`
+- Inference config must have correct `data_root` pointing to zea_synth folder
+
+**Fix**: Ensure `data_root` in inference config points to folder containing `zea_synth/haze/val.npz`
+
+---
+
+#### 7. Corruptor Model Not Loaded for Joint Inference
+**Symptom**: `ValueError: Unknown corruptor: haze` or joint sampling uses only one model
+
+**Cause**: The haze prior model needs to be loaded via `corruptor_run_id`
+
+**Where to look**:
+- `utils/inverse.py` `SGMDenoiser._load_corruptor_model()` 
+- Inference config `sgm.corruptor_run_id` must point to haze model folder
+
+**Fix**: Set `corruptor_run_id` in inference config:
+```yaml
+sgm:
+  corruptor_run_id: /path/to/wandb/run-HAZE/files
+```
+
+---
+
+#### 8. SLURM Job Fails Silently
 **Symptom**: Job completes but output file is empty or has errors
 
 **Where to look**:
@@ -295,6 +370,23 @@ source /scrfs/storage/tp030/home/f2f_ldm/.venv_joint/bin/activate
 cd /scrfs/storage/tp030/home/f2f_ldm/dehazing-diffusion/joint_diffusion
 python test_sanity.py  # or train.py, etc.
 ```
+
+---
+
+#### 9. Wandb Config Format Mismatch
+**Symptom**: `KeyError` or missing config values when loading from wandb run folder
+
+**Cause**: Wandb saves config in nested format (`key: {value: actual_value}`) but code expects flat format
+
+**Where to look**:
+- `utils/runs.py` `init_config()` — handles both formats now
+- `wandb/run-.../files/config.yaml` vs `config_flat.yaml`
+
+**Fix**: Use `convert_wandb_config.py` to create flat config:
+```bash
+python convert_wandb_config.py wandb/run-.../files/config.yaml
+```
+Or the code auto-flattens nested configs when loading.
 
 ---
 
@@ -356,25 +448,23 @@ These were intentional choices during porting:
 
 ### 🚀 Next Steps
 
-1. **Generate ZEA data** (if not done):
-   ```bash
-   sbatch /scrfs/storage/tp030/home/f2f_ldm/dehazing-diffusion/reproduce_helpers/slurm_zea_synth.sh
-   ```
+All core phases are complete. Remaining work:
 
-2. **Run training test** (synthetic data):
-   ```bash
-   sbatch slurm_test.sh
-   ```
+1. **Evaluate dehazing quality** — Compare dehazed vs ground truth using gCNR, PSNR, SSIM
+2. **Tune hyperparameters** — Adjust `lambda_coeff`, `kappa_coeff`, `noise_stddev` in inference config
+3. **Run on more samples** — Increase `num_img` and `limit_n_samples` in inference config
+4. **Visualize B-mode** — Convert RF output to B-mode images for paper figures
 
-3. **Train tissue model** (requires ZEA data):
-   ```bash
-   sbatch slurm_train_tissue.sh
-   ```
+**Quick re-run commands:**
+```bash
+cd /scrfs/storage/tp030/home/f2f_ldm/dehazing-diffusion/joint_diffusion
 
-4. **Train haze model** (can run in parallel with tissue):
-   ```bash
-   sbatch slurm_train_haze.sh
-   ```
+# Re-run inference (models already trained)
+sbatch slurm_inference_zea.sh
+
+# View results
+ls -la figures/
+```
 
 ---
 
