@@ -284,7 +284,7 @@ class Denoiser(abc.ABC):
             return x
 
         if display_bmode:
-            from joint_diffusion.utils.bmode import rf_to_bmode, extent_mm
+            from utils.bmode import rf_to_bmode, extent_mm
 
             dynamic_range = tuple(self.config.get("dynamic_range", [-50, 0]))
 
