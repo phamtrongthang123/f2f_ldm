@@ -34,9 +34,13 @@ cd "$ROOT_DIR"
 # echo "=== Test synthesis complete ==="
 
 # Uncomment below for full synthesis:
-echo "=== Running full synthesis (1000 train, 100 val) ==="
-python "$SCRIPT_DIR/zea_synthesize_dataset.py" \
-    --output-root "$ROOT_DIR/data/zea_synth" \
-    --n-train 1000 \
-    --n-val 100 \
-    --seed 42
+# echo "=== Running full synthesis (1000 train, 100 val) ==="
+# python "$SCRIPT_DIR/zea_synthesize_dataset.py" \
+#     --output-root "$ROOT_DIR/data/zea_synth" \
+#     --n-train 1000 \
+#     --n-val 100 \
+#     --seed 42
+
+python "$SCRIPT_DIR/visualize_dataset.py" \
+    --data-root "$ROOT_DIR/data/zea_synth" \
+    --n-samples 4
