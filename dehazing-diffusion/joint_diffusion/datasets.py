@@ -49,33 +49,53 @@ def get_dataset(config):
 class ZeaDataset(Dataset):
     """PyTorch Dataset for ZEA synthetic RF data (tissue or haze)."""
 
-    def __init__(self, npz_path, npz_key="rf", image_range=(0, 1), limit_n=None):
+    def __init__(self, npz_path, npz_key="rf", image_range=(0, 1), limit_n=None,
+                 mu=255, training=True):
         """
         Args:
             npz_path: Path to the .npz file
             npz_key: Key in NPZ file to load data from
             image_range: Tuple (min, max) to normalize data to
             limit_n: Optional limit on number of samples
+            mu: μ-law companding parameter (default 255)
+            training: If True, apply data augmentation in __getitem__
         """
         data = np.load(npz_path)[npz_key].astype(np.float32)
         # Stored shape: (N, n_tx, n_ax, n_el) — use all transmits as channels
         # Already in (N, C, H, W) format where C=n_tx
         if limit_n:
             data = data[:limit_n]
-        # Normalize to image_range
-        lo, hi = image_range
-        # Assume data is in [0, 1] or needs normalization
+
+        # Step 1: Normalize raw RF to [-1, 1] via min-max
         data_min, data_max = data.min(), data.max()
         if data_max > data_min:
-            data = (data - data_min) / (data_max - data_min)  # normalize to [0, 1]
-        data = data * (hi - lo) + lo
+            data = 2.0 * (data - data_min) / (data_max - data_min) - 1.0
+
+        # Step 2: μ-law companding (logarithmic compression of dynamic range)
+        data = np.sign(data) * np.log1p(mu * np.abs(data)) / np.log1p(mu)
+
+        # Step 3: Rescale from [-1, 1] to image_range
+        lo, hi = image_range
+        data = (data + 1.0) / 2.0 * (hi - lo) + lo
+
         self.data = torch.from_numpy(data)
+        self.image_range = (lo, hi)
+        self.training = training
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        return self.data[idx]
+        x = self.data[idx]
+        if self.training:
+            # Random horizontal (left-right) flip with 50% probability
+            if torch.rand(1).item() > 0.5:
+                x = torch.flip(x, [-1])
+            # Random brightness offset: uniform ±0.1
+            lo, hi = self.image_range
+            offset = (torch.rand(1).item() - 0.5) * 0.2  # uniform in [-0.1, 0.1]
+            x = (x + offset).clamp_(lo, hi)
+        return x
 
 
 def _get_zea_dataset(config, kind: str):
@@ -103,10 +123,10 @@ def _get_zea_dataset(config, kind: str):
     if not train_path.exists():
         raise FileNotFoundError(f"ZEA dataset not found: {train_path}")
 
-    train_ds = ZeaDataset(train_path, npz_key, image_range, limit_n)
-    
+    train_ds = ZeaDataset(train_path, npz_key, image_range, limit_n, training=True)
+
     if val_path.exists():
-        val_ds = ZeaDataset(val_path, npz_key, image_range, limit_n)
+        val_ds = ZeaDataset(val_path, npz_key, image_range, limit_n, training=False)
     else:
         # If no val set, use a portion of training
         print(f"Validation file not found at {val_path}, using last 10% of train")
