@@ -78,7 +78,7 @@ class ZeaDataset(Dataset):
         lo, hi = image_range
         data = (data + 1.0) / 2.0 * (hi - lo) + lo
 
-        self.data = torch.from_numpy(data)
+        self.data = torch.from_numpy(data.astype(np.float32))
         self.image_range = (lo, hi)
         self.training = training
 
