@@ -15,428 +15,74 @@ ZEA Synthesis → Train Models → Joint Inference → Evaluate
 
 ---
 
-## Phase 1: Environment Setup
+## Phase 1: Environment Setup [done]
 
-### Step 1.1: Rename folder (remove spaces) [done]
-```bash
-cd /home/tp030/f2f_ldm
-mv "reproduce helpers" dehazing-diffusion/reproduce_helpers
-```
-
-### Step 1.2: Create ZEA environment [done]
-```bash
-cd /home/tp030/f2f_ldm
-uv venv .venv_zea
-uv pip install --python .venv_zea zea "jax[cuda12]" numpy
-```
-
-### Step 1.3: Create joint_diffusion environment [done]
-```bash
-cd /home/tp030/f2f_ldm
-uv venv .venv_joint
-uv pip install --python .venv_joint torch torchvision
-uv pip install --python .venv_joint -r dehazing-diffusion/joint_diffusion/requirements/requirements_pytorch.txt
-```
+**Environments created:**
+- `.venv_zea` — ZEA synthesis (JAX/CUDA)
+- `.venv_joint` — Training/inference (PyTorch)
 
 ---
 
-## Phase 2: Code Modifications (TF → PyTorch Port)
+## Phase 2: Code Modifications (TF → PyTorch Port) [done]
 
-### Step 2.1: Add ZEA dataset loader to `datasets.py` [done]
+**Key files:**
+- `datasets.py` — `ZeaDataset` loads RF data as `(N, n_tx, H, W)`, adapts to any `n_tx`
+- `utils/corruptors.py` — `HazeCorruptor` implements `y = x + γh`
+- `configs/training/score_zea_{tissue,haze}.yaml` — Training configs
+- `configs/inference/paper/zea_dehaze_pigdm.yaml` — PIGDM inference config
 
-**File**: `/home/tp030/f2f_ldm/dehazing-diffusion/joint_diffusion/datasets.py`
-
-`ZeaDataset` loads stored RF data with shape `(N, n_tx, n_ax, n_el)` and uses all transmits as channels:
-
-```python
-data = np.load(npz_path)[npz_key].astype(np.float32)
-# Stored shape: (N, n_tx, n_ax, n_el) — use all transmits as channels
-# Already in (N, C, H, W) format where C=n_tx
-```
-
-`image_shape` is set dynamically from the data: `[n_tx, *image_size]`. This means changing `n_tx` in the synthesis script (e.g. from 3 to 15) requires no code changes downstream — the dataset loader, model `in_channels`, and everything else adapts automatically.
+See **Port Status & Gap Analysis** section below for full details.
 
 ---
 
-### Step 2.2: Add Haze Corruptor to `corruptors.py` [So you don't need it right now if you're still working on synthesis and training (Phases 4-5). You'll need it before running inference in Phase 6]
+## Phase 3: Sanity Test the PyTorch Port [done]
 
-**File**: `/home/tp030/f2f_ldm/dehazing-diffusion/joint_diffusion/utils/corruptors.py`
+**Scripts:**
+- `joint_diffusion/test_sanity.py` — Tests imports, SDEs, layers, NCSNv2, loss+backward, sampling
+- `joint_diffusion/test_training_loop.py` — Tests full training pipeline with synthetic data
+- `joint_diffusion/slurm_test.sh` — SLURM wrapper to run both tests on A100
 
-**Action**: Add at the end of the file (after line 291):
-```python
-import torch
-
-@register_corruptor(name="haze")
-class HazeCorruptor(Corruptor):
-    """Additive haze corruptor for ultrasound dehazing.
-
-    Measurement model: y = x + gamma * h
-    where x is clean tissue, h is haze, gamma is haze strength.
-    """
-
-    def __init__(self, config, train=True):
-        super().__init__(config, dataset_name="zea_haze", model=True)
-        self.load_corruptor_dataset(train)
-        self.blend_factor = config.noise_stddev  # gamma (haze strength)
-        self.noise_stddev = self.blend_factor
-
-    def corrupt(self, images):
-        """Add haze to clean tissue images."""
-        batch_size = images.shape[0]
-        self.noise = next(self.gen)[:batch_size]
-        noisy_images = images + self.blend_factor * self.noise
-        return noisy_images
-```
-
----
-
-### Step 2.3: Create training config for tissue model [done]
-
-**File**: `/home/tp030/f2f_ldm/dehazing-diffusion/joint_diffusion/configs/training/score_zea_tissue.yaml`
-
-Key parameters (from paper Section 3.2.4):
-- `batch_size: 8`, `lr: 1e-4`, `epochs: 100`
-- `channels: 32`, `kernel_size: 3` (NCSNv2)
-- `image_size: [1024, 64]`, `dataset_name: zea_tissue`
-
----
-
-### Step 2.4: Create training config for haze model [done]
-
-**File**: `/home/tp030/f2f_ldm/dehazing-diffusion/joint_diffusion/configs/training/score_zea_haze.yaml`
-
-Same as tissue config, only `dataset_name: zea_haze`.
-
----
-
-### Step 2.5: Create inference config [done]
-
-**File**: `/home/tp030/f2f_ldm/dehazing-diffusion/joint_diffusion/configs/inference/paper/zea_dehaze_pigdm.yaml`
-
-Key parameters (from paper Section 3.2.4):
-- `lambda_coeff: 0.5`, `kappa_coeff: 0.5` (paper recommends ~0.5 for both)
-- `num_scales: 200` (T=200 diffusion steps)
-- `guidance: pigdm`, `corruptor: haze`
-- `run_id.sgm` and `sgm.corruptor_run_id` need to be filled after training
-
----
-
-### Step 2.6: Shell scripts 
-
-- `/home/tp030/f2f_ldm/dehazing-diffusion/reproduce_helpers/zea_synth_run.sh` - Runs synthesis then visualization
-- `/home/tp030/f2f_ldm/dehazing-diffusion/reproduce_helpers/slurm_zea_synth.sh` - SLURM job submission
-
----
-
-## Phase 3: Sanity Test the PyTorch Port
-
-Run these tests **before** generating data or training. Each layer catches progressively deeper issues. Stop and fix before moving on if any layer fails.
-
-### Step 3.1: Layer 1 — Import smoke test
-
-Verify all ported modules import without errors.
-
-```bash
-cd /home/tp030/f2f_ldm
-source .venv_joint/bin/activate
-cd dehazing-diffusion/joint_diffusion
-python -c "
-import torch
-print(f'PyTorch {torch.__version__}')
-print(f'CUDA available: {torch.cuda.is_available()}')
-
-# Core modules
-from datasets import get_dataset
-from generators.models import get_model
-from generators.layers import ConvBlock, ResidualBlock, DownSample, UpSample
-from generators.SGM.SGM import NCSNv2
-from generators.SGM.sde_lib import get_sde
-from generators.SGM.sampling import get_predictor, get_corrector
-from utils.corruptors import get_corruptor
-from utils.inverse import get_denoiser
-
-print('All imports OK')
-"
-```
-
-### Step 3.2: Layer 2 — Component shape tests
-
-Verify each ported component produces correct tensor shapes.
-
-```bash
-cd /home/tp030/f2f_ldm/dehazing-diffusion/joint_diffusion
-source /home/tp030/f2f_ldm/.venv_joint/bin/activate
-python -c "
-import torch
-import numpy as np
-
-# --- Test 1: Layers ---
-from generators.layers import ConvBlock, ResidualBlock
-x = torch.randn(2, 1, 128, 64)  # (B, C, H, W)
-conv = ConvBlock(in_channels=1, out_channels=32, kernel_size=3)
-out = conv(x)
-assert out.shape == (2, 32, 128, 64), f'ConvBlock: expected (2,32,128,64), got {out.shape}'
-print(f'ConvBlock OK: {x.shape} -> {out.shape}')
-
-# --- Test 2: Score network forward pass ---
-from generators.SGM.SGM import NCSNv2
-from utils.utils import AttrDict
-config = AttrDict({
-    'channels': 32,
-    'image_size': [128, 64],
-    'num_scales': 10,
-    'sigma': 25.0,
-    'normalization': 'batch',
-    'kernel_size': 3,
-    'activation': 'relu',
-    'drop_prob': None,
-    'upmode': 'upconv',
-    'embed_dim': 256,
-})
-model = NCSNv2(config)
-x = torch.randn(2, 1, 128, 64)
-t = torch.randint(0, 10, (2,))
-score = model(x, t)
-assert score.shape == x.shape, f'NCSNv2: expected {x.shape}, got {score.shape}'
-print(f'NCSNv2 OK: input {x.shape} -> score {score.shape}')
-
-# --- Test 3: SDE ---
-from generators.SGM.sde_lib import get_sde
-sde = get_sde(config)
-t = torch.rand(2)
-mean, std = sde.marginal_prob(x, t)
-assert mean.shape == x.shape, f'SDE marginal_prob mean: expected {x.shape}, got {mean.shape}'
-print(f'SDE OK: marginal_prob shapes correct')
-
-print()
-print('All component shape tests PASSED')
-"
-```
-
-### Step 3.3: Layer 3 — Dataset loading round-trip
-
-Verify the ZEA dataset loader returns correct shapes and value ranges. Requires a small synthesized dataset (generate with `zea_synth_run.sh` first).
-
-```bash
-cd /home/tp030/f2f_ldm
-source .venv_joint/bin/activate
-cd dehazing-diffusion/joint_diffusion
-python -c "
-import torch
-from datasets import get_dataset
-from utils.utils import AttrDict
-
-for name in ['zea_tissue', 'zea_haze']:
-    config = AttrDict({
-        'dataset_name': name,
-        'data_root': '../../data',
-        'batch_size': 4,
-        'image_range': [0, 1],
-        'shuffle': True,
-        'seed': 42,
-        'npz_key': 'rf',
-    })
-    train, val = get_dataset(config)
-    batch = next(iter(train))
-    assert isinstance(batch, torch.Tensor), f'Expected torch.Tensor, got {type(batch)}'
-    assert batch.shape[1] == 3, f'Expected channel dim=n_tx=3, got {batch.shape[1]}'
-    assert batch.shape[2:] == (1024, 64), f'Expected spatial (1024,64), got {batch.shape[2:]}'
-    print(f'{name}: batch={batch.shape}, range=[{batch.min():.3f}, {batch.max():.3f}] OK')
-
-print()
-print('Dataset loading tests PASSED')
-"
-```
-
-### Step 3.4: Layer 4 — Training smoke test (2 steps)
-
-Run the training loop for 2 steps on dummy data to verify the full pipeline works end-to-end.
-
-```bash
-cd /home/tp030/f2f_ldm
-source .venv_joint/bin/activate
-cd dehazing-diffusion/joint_diffusion
-
-export WANDB_MODE=disabled
-python train.py -c configs/training/score_zea_tissue.yaml \
-  --data_root ../../data \
-  --epochs 1 \
-  --limit_n_samples 8 \
-  --batch_size 2
-```
-
-**Expected**: Completes 1 epoch without errors. Loss value is printed and is finite (not NaN/Inf).
-
-### Step 3.5: Layer 5 — Corruptor test
-
-Verify the HazeCorruptor produces valid corrupted images.
-
-```bash
-cd /home/tp030/f2f_ldm/dehazing-diffusion/joint_diffusion
-source /home/tp030/f2f_ldm/.venv_joint/bin/activate
-python -c "
-import torch
-from utils.corruptors import get_corruptor
-from utils.utils import AttrDict
-
-config = AttrDict({
-    'dataset_name': 'zea_tissue',
-    'data_root': '../../data',
-    'batch_size': 4,
-    'image_range': [0, 1],
-    'image_size': [128, 64],
-    'color_mode': 'grayscale',
-    'shuffle': True,
-    'seed': 42,
-    'npz_key': 'rf',
-    'noise_stddev': 0.5,
-    'corruptor': 'haze',
-})
-
-corruptor = get_corruptor(config, train=True)
-clean = torch.randn(4, 1, 128, 64)
-corrupted = corruptor.corrupt(clean)
-assert corrupted.shape == clean.shape, f'Shape mismatch: {corrupted.shape} vs {clean.shape}'
-assert not torch.isnan(corrupted).any(), 'NaN in corrupted output'
-assert not torch.equal(clean, corrupted), 'Corrupted should differ from clean'
-print(f'Corruptor OK: {clean.shape} -> {corrupted.shape}')
-print(f'Clean range: [{clean.min():.3f}, {clean.max():.3f}]')
-print(f'Corrupted range: [{corrupted.min():.3f}, {corrupted.max():.3f}]')
-print()
-print('Corruptor test PASSED')
-"
-```
+**To run:** `sbatch slurm_test.sh` → check `/scrfs/storage/tp030/home/f2f_ldm/slurm_logs/`
 
 ---
 
 ## Phase 4: Generate Synthetic Data [done]
 
-### Step 4.1: Test ZEA API compatibility [done]
+**Scripts:**
+- `reproduce_helpers/zea_synthesize_dataset.py` — Generates tissue and haze RF data using ZEA
+- `reproduce_helpers/visualize_dataset.py` — B-mode visualization of generated data
+- `reproduce_helpers/slurm_zea_synth.sh` — SLURM wrapper for full synthesis (1000 train, 100 val)
 
-```bash
-cd /home/tp030/f2f_ldm
-source .venv_zea/bin/activate
-KERAS_BACKEND=jax python -c "
-from zea.probes import Probe
-from zea.scan import Scan
-from zea.ops import Beamform
-from zea.simulator import simulate_rf
-from zea.beamform.delays import compute_t0_delays_planewave
-print('All ZEA imports successful')
-"
-```
+**To run:** `sbatch reproduce_helpers/slurm_zea_synth.sh`
 
-### Step 4.2: Synthesis script [done]
-
-**File**: `/home/tp030/f2f_ldm/dehazing-diffusion/reproduce_helpers/zea_synthesize_dataset.py`
-
-- Uses `phantoms.fish()` for tissue (same as simulation reference, ~104 scatterers)
-- Haze adds 30-60 extra random scatterers with lower magnitudes (0.3-0.8)
-- Stores raw float32 RF data from `simulate_rf`, no normalization
-- Stores all transmits: shape `(N, n_tx, n_ax, n_el)` — e.g. `(N, 3, 1024, 64)` with default `n_tx=3`
-- `n_tx` is configurable in the synthesis script; downstream code adapts automatically
-- Output structure: `{output_root}/tissue/train.npz`, `val.npz`, `{output_root}/haze/train.npz`, `val.npz`
-- NPZ key: `rf`
-
-### Step 4.3: Run small test synthesis
-
-```bash
-cd /home/tp030/f2f_ldm
-bash dehazing-diffusion/reproduce_helpers/zea_synth_run.sh
-```
-
-This runs 10 train + 2 val samples and then visualization.
-
-### Step 4.4: Verify output
-
-```bash
-python -c "
-import numpy as np
-from pathlib import Path
-
-root = Path('data/zea_synth_test')
-for kind in ['tissue', 'haze']:
-    train = np.load(root / kind / 'train.npz')['rf']
-    val = np.load(root / kind / 'val.npz')['rf']
-    print(f'{kind}: train={train.shape}, val={val.shape}, dtype={train.dtype}')
-"
-```
-
-Expected output:
-```
-tissue: train=(10, 3, 1024, 64), val=(2, 3, 1024, 64), dtype=float32
-haze: train=(10, 3, 1024, 64), val=(2, 3, 1024, 64), dtype=float32
-```
-
-### Step 4.5: Visualization script [done]
-
-**File**: `/home/tp030/f2f_ldm/dehazing-diffusion/reproduce_helpers/visualize_dataset.py`
-
-- Loads stored RF data from npz files
-- Adds channel dim `[:, :, :, np.newaxis]` to get `(n_tx, n_ax, n_el, 1)`
-- Feeds directly into `zea.Pipeline` for B-mode reconstruction (same flow as simulation reference)
-- Shows tissue (top row) and haze (bottom row) side by side
-- Saves to `{data_root}/visualization.png`
-
-### Step 4.6: Run full synthesis
-
-```bash
-cd /home/tp030/f2f_ldm
-source .venv_zea/bin/activate
-KERAS_BACKEND=jax python dehazing-diffusion/reproduce_helpers/zea_synthesize_dataset.py \
-  --output-root data/zea_synth \
-  --n-train 1000 --n-val 100 \
-  --seed 42
-```
+**Output:**
+- `data/zea_synth/tissue/{train,val}.npz` — Clean tissue RF data
+- `data/zea_synth/haze/{train,val}.npz` — Haze RF data
+- Shape: `(N, n_tx, n_ax, n_el)` = `(N, 3, 1024, 64)`, dtype: `float32`, key: `rf`
 
 ---
 
 ## Phase 5: Train Diffusion Models
 
-### Step 5.1: Test dataset loading
+> **Requires**: ZEA data from Phase 4
 
+**Scripts:**
+- `joint_diffusion/slurm_train.sh` — SLURM wrapper for training
+- `joint_diffusion/train_run.sh` — Inner script (edit to switch between tissue/haze config)
+- `joint_diffusion/train.py` — Main training script
+
+**Configs:**
+- `configs/training/score_zea_tissue.yaml` — Tissue model (100 epochs, bs=8, lr=1e-4)
+- `configs/training/score_zea_haze.yaml` — Haze model (same params)
+
+**To train tissue model:**
 ```bash
-cd /home/tp030/f2f_ldm
-source .venv_joint/bin/activate
-cd dehazing-diffusion/joint_diffusion
-python -c "
-from datasets import get_dataset
-from utils.utils import AttrDict
-
-config = AttrDict({
-    'dataset_name': 'zea_tissue',
-    'data_root': '../../data',
-    'batch_size': 4,
-    'image_range': [0, 1],
-    'shuffle': True,
-    'seed': 1234,
-    'npz_key': 'rf',
-})
-train, val = get_dataset(config)
-batch = next(iter(train))
-print(f'Batch shape: {batch.shape}')
-print(f'Value range: [{batch.min():.3f}, {batch.max():.3f}]')
-"
+sbatch joint_diffusion/slurm_train.sh
 ```
 
-### Step 5.2: Train tissue model
+**To train haze model:** Edit `train_run.sh` to use `score_zea_haze.yaml`, then `sbatch`.
 
-```bash
-cd /home/tp030/f2f_ldm
-source .venv_joint/bin/activate
-cd dehazing-diffusion/joint_diffusion
-
-export WANDB_MODE=offline
-python train.py -c configs/training/score_zea_tissue.yaml \
-  --data_root ../../data
-```
-
-### Step 5.3: Train haze model
-
-```bash
-python train.py -c configs/training/score_zea_haze.yaml \
-  --data_root ../../data
-```
+**Checkpoints:** Saved to `wandb/<run_id>/files/training_checkpoints/ckpt-<epoch>.pt`
 
 ---
 
@@ -482,91 +128,245 @@ score = gcnr(dehazed_region, background_region)
 
 ## Port Status & Gap Analysis (2026-01-29)
 
-### What Was Ported (Phase 2 Core SGM Files) [done]
+> **⚠️ MAJOR UPDATE**: All TensorFlow dependencies have been removed. The codebase now runs on pure PyTorch.
 
-These 6 files were fully rewritten from TensorFlow to PyTorch and pass all sanity tests
-(`joint_diffusion/test_sanity.py` — all 6 test groups PASS):
+---
 
-| File | What It Contains |
-|------|-----------------|
-| `generators/SGM/sde_lib.py` | `SDE`, `VPSDE`, `VESDE`, `subVPSDE`, `simple` — all use `torch.*` |
-| `generators/layers.py` | `ConvBlock`, `ResidualBlock`, `RCUBlock`, `MSFBlock`, `CRPBlock`, `RefineBlock` — all `nn.Module` |
-| `generators/SGM/SGM.py` | `NCSNv2` (backbone) + `ScoreNet` (wrapper with SDE, loss, score computation) |
-| `generators/SGM/sampling.py` | `ScoreSampler`, `EulerMaruyamaPredictor`, `ReverseDiffusionPredictor`, `LangevinCorrector`, `AnnealedLangevinDynamics` |
-| `generators/SGM/guidance.py` | `PIGDM`, `DPS`, `Projection` — gradient-based guidance using `torch.autograd.grad` |
-| `utils/corruptors.py` | `GaussianCorruptor`, `CSCorruptor`, `HazeCorruptor` — pure PyTorch |
+### ✅ What Was Ported (Complete)
 
-Also created:
-- `generators/__init__.py`, `generators/SGM/__init__.py`, `utils/__init__.py`
-- `test_sanity.py` — comprehensive test covering imports, SDEs, layers, NCSNv2, loss+backward, sampling
+All files that previously imported TensorFlow have been rewritten. The following table shows what was changed:
 
-### What Still Has TensorFlow Dependencies (NOT Ported)
+| File | Status | What Changed |
+|------|--------|--------------|
+| `generators/SGM/sde_lib.py` | ✅ Ported (Session 1) | `VPSDE`, `VESDE`, `subVPSDE`, `simple` — pure `torch.*` |
+| `generators/layers.py` | ✅ Ported (Session 1) | All layers are `nn.Module` subclasses |
+| `generators/SGM/SGM.py` | ✅ Ported (Session 1) | `NCSNv2`, `ScoreNet` with `score_loss()` method |
+| `generators/SGM/sampling.py` | ✅ Ported (Session 1) | `ScoreSampler`, predictors, correctors |
+| `generators/SGM/guidance.py` | ✅ Ported (Session 1) | `PIGDM`, `DPS`, `Projection` using `torch.autograd.grad` |
+| `utils/corruptors.py` | ✅ Ported (Session 1) | `GaussianCorruptor`, `CSCorruptor`, `HazeCorruptor` |
+| `utils/utils.py` | ✅ Ported (Session 2) | Removed `tensorflow` import, kept PyTorch/numpy utilities |
+| `utils/gpu_config.py` | ✅ Ported (Session 2) | Replaced `tf.config` with `torch.cuda` |
+| `utils/signals.py` | ✅ Stubbed (Session 2) | Only used by legacy TF datasets, not ZEA |
+| `datasets.py` | ✅ Ported (Session 2) | Removed TF datasets; `ZeaDataset` returns PyTorch DataLoader |
+| `generators/models.py` | ✅ Ported (Session 2) | Removed TF/Keras; only `score` and `glow` paths remain |
+| `utils/checkpoints.py` | ✅ Ported (Session 2) | Pure PyTorch `torch.save`/`torch.load` + `EMAHelper` class |
+| `utils/callbacks.py` | ✅ Ported (Session 2) | Plain Python classes (not Keras Callbacks) |
+| `train.py` | ✅ Rewritten (Session 2) | Standard PyTorch training loop with EMA, gradient clipping |
+| `utils/inverse.py` | ✅ Ported (Session 2) | `SGMDenoiser`, `BM3DDenoiser`, `NLMDenoiser` — pure PyTorch |
 
-These files still import TensorFlow and will block `train.py` / `inference.py`:
+**New files created:**
+- `test_sanity.py` — Tests imports, SDEs, layers, NCSNv2, loss+backward, sampling (6 test groups)
+- `test_training_loop.py` — Tests full training pipeline with synthetic data
+- `slurm_train.sh` + `train_run.sh` — SLURM job scripts for training
+- `slurm_test.sh` + `test_run.sh` — SLURM job scripts for testing
 
-| File | TF? | Needed For | Notes |
-|------|-----|-----------|-------|
-| `generators/models.py` | Yes (`tensorflow_addons`, `keras`) | `train.py`, `inference.py` | `get_model()` factory — orchestrates GAN/Score/Glow/UNet |
-| `utils/callbacks.py` | Yes (Keras `Callback`) | `train.py` | `EvalDataset`, `Monitor` — Keras callback classes |
-| `utils/checkpoints.py` | Yes (hybrid TF+torch) | `train.py`, `inference.py` | `ModelCheckpoint` — handles both frameworks |
-| `utils/inverse.py` | Yes (hybrid TF+torch) | `inference.py` | `get_denoiser()`, `SGMDenoiser` |
-| `utils/signals.py` | Yes (`tfa`) | `datasets.py` (MNIST/CelebA only, **not** ZEA) | `add_gaussian_noise`, `RandomTranslation` |
-| `utils/utils.py` | Yes (hybrid) | Nearly everything | `set_random_seed`, `load_config_from_yaml`, etc. |
-| `utils/gpu_config.py` | Likely TF | `train.py` | GPU config |
-| `datasets.py` | Yes (top-level TF) | `train.py` | Top imports are TF; `ZeaDataset` at bottom is PyTorch |
-| `train.py` | Yes (`keras`, `wandb.keras`) | Training entry point | Uses `model.fit()`, Keras callbacks |
-| `inference.py` | Chains through TF modules | Inference entry point | Uses `get_denoiser`, `get_model` |
+---
 
-### Functions Referenced in plan.md That Don't Exist in the Port
+### 🧪 How to Verify the Port Works
 
-- `get_sde(config)` — plan.md Step 3.2 references this factory function, but it was never in `sde_lib.py`. Use the SDE classes directly (e.g. `VESDE(sigma_min=..., sigma_max=..., N=...)`) or add a factory.
-- `AttrDict` — plan.md uses `from utils.utils import AttrDict`, but the codebase uses `easydict.EasyDict`. Use `easydict.EasyDict` or define a simple `AttrDict` wrapper.
-- `DownSample`, `UpSample` — plan.md Step 3.1 imports these from `generators.layers`, but the PyTorch port doesn't include them (they were TF-only layers for UNet/GAN, not needed for NCSNv2).
-- `NCSNv2(config)(x, t)` — plan.md Step 3.2 calls `model(x, t)`. The ported `NCSNv2` takes only `(x)`. Time conditioning is handled in `ScoreNet.get_score(x, t)` via score division by `std(t)`.
+Run these tests in order. Stop and debug if any fail.
 
-### Next Step: Phase 5 (Training)
-
-`train.py` cannot run as-is because it imports TF-dependent modules. Two options:
-
-**Option A (recommended): Write a minimal PyTorch training script** that bypasses the TF `train.py`:
-
+**Test 1: Sanity tests (imports, shapes, loss)**
 ```bash
-cd /home/tp030/f2f_ldm/dehazing-diffusion/joint_diffusion
-source /home/tp030/f2f_ldm/.venv_joint/bin/activate
-python train_pytorch.py -c configs/training/score_zea_tissue.yaml --data_root ../../data
+cd /scrfs/storage/tp030/home/f2f_ldm/dehazing-diffusion/joint_diffusion
+source /scrfs/storage/tp030/home/f2f_ldm/.venv_joint/bin/activate
+python test_sanity.py
+```
+Expected: All 6 test groups PASS.
+
+**Test 2: Training loop (synthetic data, no real data needed)**
+```bash
+python test_training_loop.py
+```
+Expected: Completes 2 epochs, loss is finite, checkpoint saves/loads.
+
+**Test 3: Full test via SLURM (on A100)**
+```bash
+sbatch slurm_test.sh
+# Check output: /scrfs/storage/tp030/home/f2f_ldm/slurm_logs/<node>_<jobid>.out
 ```
 
-This script would directly use `ScoreNet` + `ZeaDataset` + a standard PyTorch training loop.
-It needs: config loading (YAML → dict), `ZeaDataset`, `ScoreNet`, `torch.optim.Adam`, checkpointing, and optionally wandb logging.
+---
 
-**Option B: Port the remaining TF files** (`generators/models.py`, `utils/callbacks.py`, `utils/checkpoints.py`, `datasets.py` top-level, `train.py`). This is more work but preserves the original interface.
+### ⚠️ WARNINGS: Things That Could Break
 
-### How to Know If the Port Is Wrong (Reference Files)
+#### 1. Dataset Shape Mismatch
+**Symptom**: `RuntimeError: shape mismatch` or `Expected (B,C,H,W) got (B,H,W,C)`
 
-If something produces wrong results, compare against these official PyTorch implementations in `reproduce_helpers/`:
+**Cause**: PyTorch uses channel-first `(B, C, H, W)`, TensorFlow used channel-last `(B, H, W, C)`.
 
-| Ported File | Reference File(s) | What to Check |
+**Where to look**:
+- `datasets.py` line 63-79: `ZeaDataset.__init__` — data should already be `(N, n_tx, H, W)`
+- `generators/SGM/SGM.py` line 180-220: `ScoreNet.score_loss` — expects `(B, C, H, W)`
+- `utils/corruptors.py`: All corruptors assume channel-first
+
+**Fix**: If your NPZ data is `(N, H, W, n_tx)`, transpose it:
+```python
+data = data.transpose(0, 3, 1, 2)  # (N, H, W, C) -> (N, C, H, W)
+```
+
+---
+
+#### 2. NaN/Inf Loss
+**Symptom**: `loss = nan` or `loss = inf` during training
+
+**Causes & where to look**:
+1. **Sigma explosion** in VESDE — `sde_lib.py` line 85-100: Check `sigma_max` isn't too large
+2. **Score explosion** — `SGM.py` line 200-210: `score = model(x) / std` — if `std ≈ 0`, division explodes
+3. **Gradient explosion** — `train.py` uses `grad_clip=1.0` by default, increase if needed
+
+**Fix**: Add gradient clipping or reduce learning rate:
+```python
+torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+```
+
+---
+
+#### 3. EMA Not Working
+**Symptom**: Model generates noise even after many epochs
+
+**Cause**: EMA weights not being used for sampling/inference
+
+**Where to look**:
+- `utils/checkpoints.py` line 160-220: `EMAHelper` class
+- `train.py` line 115: `ema.update(model)` must be called after each optimizer step
+- Checkpoint must save both model and EMA: `ckpt_manager.save()` saves both
+
+**Fix**: When loading for inference, apply EMA weights:
+```python
+ema.apply_shadow(model)  # Apply EMA weights before sampling
+```
+
+---
+
+#### 4. PIGDM Guidance Not Working
+**Symptom**: Guided sampling produces same result as unconditional
+
+**Cause**: Gradient not flowing through guidance computation
+
+**Where to look**:
+- `generators/SGM/guidance.py` line 45-80: `PIGDM.guide()` uses `torch.autograd.grad`
+- `generators/SGM/sampling.py` line 150-180: Predictor must have `requires_grad=True` on input
+
+**Fix**: Ensure `x` has gradients enabled:
+```python
+x = x.requires_grad_(True)
+```
+
+---
+
+#### 5. Checkpoint Loading Fails
+**Symptom**: `KeyError` or `RuntimeError: Error(s) in loading state_dict`
+
+**Cause**: Old TF checkpoints vs new PyTorch format
+
+**Where to look**:
+- `utils/checkpoints.py` line 85-110: `ModelCheckpoint.restore()`
+- Old format: `torch.save(model.state_dict(), path)`
+- New format: `torch.save({"model_state_dict": ..., "optimizer_state_dict": ..., "epoch": ...}, path)`
+
+**Fix**: For old checkpoints:
+```python
+state = torch.load(path)
+if "model_state_dict" in state:
+    model.load_state_dict(state["model_state_dict"])
+else:
+    model.load_state_dict(state)  # Legacy format
+```
+
+---
+
+#### 6. SLURM Job Fails Silently
+**Symptom**: Job completes but output file is empty or has errors
+
+**Where to look**:
+- Check SLURM log: `/scrfs/storage/tp030/home/f2f_ldm/slurm_logs/<node>_<jobid>.out`
+- Check if container exists: `ls -la $HOME/qwen3vl-cu128.sif`
+- Check if venv exists: `ls -la /scrfs/storage/tp030/home/f2f_ldm/.venv_joint`
+
+**Fix**: Run the inner script manually first:
+```bash
+source /scrfs/storage/tp030/home/f2f_ldm/.venv_joint/bin/activate
+cd /scrfs/storage/tp030/home/f2f_ldm/dehazing-diffusion/joint_diffusion
+python test_sanity.py  # or train.py, etc.
+```
+
+---
+
+### 📁 Reference Files for Debugging
+
+If results are wrong, compare against official PyTorch implementations:
+
+| Ported File | Reference | Line-by-line check |
 |---|---|---|
-| `generators/SGM/sde_lib.py` | `reproduce_helpers/score_sde_pytorch/sde_lib.py` | Nearly 1:1. Extra: `simple` class and `forward_diffuse` method from TF original. |
-| `generators/layers.py` | `reproduce_helpers/ncsnv2/models/layers.py` | `ResidualBlock`, `RCUBlock`, `MSFBlock`, `CRPBlock`, `RefineBlock` — these are ground truth. |
-| `generators/SGM/SGM.py` (NCSNv2) | `reproduce_helpers/ncsnv2/models/ncsnv2.py` | Official takes `(x, y)` where `y` is discrete sigma index and divides by `sigma[y]`. Port takes `(x)` only; sigma division is in `ScoreNet.get_score()`. This is intentional. |
-| `generators/SGM/SGM.py` (ScoreNet loss) | `reproduce_helpers/score_sde_pytorch/losses.py` → `get_sde_loss_fn()` | Reference for denoising score matching loss. |
-| `generators/SGM/SGM.py` (get_score) | `reproduce_helpers/score_sde_pytorch/models/utils.py` → `get_score_fn()` | Reference for how model output → score. |
-| `generators/SGM/sampling.py` | `reproduce_helpers/score_sde_pytorch/sampling.py` | Official PC sampler, predictors, correctors. |
-| `generators/SGM/guidance.py` | **No reference** — original code by paper authors | Only reference is the TF version in the repo + paper Algorithm 1 (Section 3.2). |
-| `generators/layers.py` (normalization) | `reproduce_helpers/ncsnv2/models/normalization.py` | `InstanceNorm2dPlus`, `VarianceNorm2d`, etc. Port uses standard `nn.InstanceNorm2d`. |
+| `generators/SGM/sde_lib.py` | `reproduce_helpers/score_sde_pytorch/sde_lib.py` | `marginal_prob()`, `prior_sampling()`, `discretize()` |
+| `generators/layers.py` | `reproduce_helpers/ncsnv2/models/layers.py` | `ResidualBlock`, `RefineBlock`, `ConvMeanPool` |
+| `generators/SGM/SGM.py` | `reproduce_helpers/ncsnv2/models/ncsnv2.py` | Architecture, forward pass |
+| `generators/SGM/SGM.py` (loss) | `reproduce_helpers/score_sde_pytorch/losses.py` | `get_sde_loss_fn()` |
+| `generators/SGM/sampling.py` | `reproduce_helpers/score_sde_pytorch/sampling.py` | Predictor/corrector updates |
+| `generators/SGM/guidance.py` | **No reference** — paper Algorithm 1 | TF version in original repo |
 
-### Specific Things That Could Go Wrong
+---
 
-1. **Shape broadcasting** — `std[:, None, None, None]` assumes `(B, C, H, W)` channel-first. If spatial dims are wrong, check this pattern in `sde_lib.py`, `SGM.py`, `sampling.py`.
+### 🔧 Key Design Decisions
 
-2. **Score normalization** — `ScoreNet.get_score()` divides model output by `std`. The `while std.dim() < x.dim(): std = std.unsqueeze(-1)` expansion must match what `score_loss()` does. Both must be consistent.
+These were intentional choices during porting:
 
-3. **Gradient computation for PIGDM** — `EulerMaruyamaPredictor.update_fn()` uses `torch.autograd.grad(x_mean, x_input, ...)` to compute `dx_mean/dx`. If PIGDM guidance gives wrong results, check this against the TF `tf.GradientTape` version.
+1. **`NCSNv2(x)` takes only `x`, not `(x, t)`**
+   - Time conditioning is in `ScoreNet.get_score(x, t)` which divides by `std(t)`
+   - This matches the continuous-time SDE formulation from score_sde
 
-4. **ResidualBlock downsampling** — Uses `ConvMeanPool` (average of 4 offset grids), not strided convolution. Reference: `reproduce_helpers/ncsnv2/models/layers.py:291-313`.
+2. **No `get_sde()` factory function**
+   - Use SDE classes directly: `VESDE(sigma_min=..., sigma_max=..., N=...)`
+   - `ScoreNet` auto-creates SDE from config
 
-5. **InstanceNorm2d default** — Port uses `nn.InstanceNorm2d` which has `affine=False` by default. The reference `ncsnv2` code also uses `affine=False` for unconditional normalization, so this is correct. If you see scale issues, check here.
+3. **EMA handled by `EMAHelper` class, not optimizer wrapper**
+   - TF used `tfa.optimizers.MovingAverage`
+   - PyTorch version uses explicit shadow parameter tracking
+   - Call `ema.update(model)` after each optimizer step
+
+4. **Callbacks are plain Python, not Keras Callbacks**
+   - `on_epoch_end(epoch, logs)` interface preserved
+   - But no automatic integration with `model.fit()`
+
+5. **Legacy TF datasets removed**
+   - MNIST, CelebA, TMNIST, SineNoise — all removed
+   - Only ZEA datasets work now
+   - If you need MNIST, use `torchvision.datasets.MNIST`
+
+---
+
+### 📋 Files That Were Intentionally Removed/Stubbed
+
+| File/Function | Reason |
+|---|---|
+| `utils/signals.py` (most functions) | Only used by TF datasets, not ZEA |
+| `generators/GAN.py` | GAN model not needed for diffusion |
+| `generators/layers.py` (UNet, encoder, decoder) | Only NCSNv2 needed for score model |
+| `datasets.py` (MNIST, CelebA, etc.) | Only ZEA datasets needed |
+| `utils/utils.py` (`tf_expand_multiple_dims`, `random_augmentation`) | TF-specific utilities |
+| `utils/utils.py` (`get_normalization_layer`) | TF Rescaling layer |
+
+---
+
+### 🚀 Next Steps
+
+1. **Generate ZEA data** (if not done):
+   ```bash
+   sbatch /scrfs/storage/tp030/home/f2f_ldm/dehazing-diffusion/reproduce_helpers/slurm_zea_synth.sh
+   ```
+
+2. **Run training test** (synthetic data):
+   ```bash
+   sbatch slurm_test.sh
+   ```
+
+3. **Train tissue model** (requires ZEA data):
+   ```bash
+   sbatch slurm_train.sh
+   ```
+
+4. **Train haze model** (edit `train_run.sh` to use `score_zea_haze.yaml`)
 
 ---
 
