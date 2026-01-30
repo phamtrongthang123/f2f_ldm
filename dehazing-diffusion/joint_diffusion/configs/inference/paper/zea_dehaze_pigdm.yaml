@@ -30,6 +30,10 @@ disable_corruptor_model: false
 
 limit_n_samples: 100
 
+# B-mode display settings
+display_bmode: true
+dynamic_range: [-50, 0]  # dB
+
 metrics:
   - psnr
   - ssim

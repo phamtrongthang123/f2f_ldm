@@ -258,6 +258,8 @@ class Denoiser(abc.ABC):
 
     def plot(self, save=True, zoom=None, figsize=None, dpi=300):
         """Plot denoising results."""
+        display_bmode = self.config.get("display_bmode", False)
+
         denoised = self.denoised_samples
         if self.keep_track and isinstance(denoised, list):
             denoised = denoised[-1]
@@ -270,25 +272,41 @@ class Denoiser(abc.ABC):
                 denoised = denoised[-1]
                 noise_samples = noise_samples[-1] if noise_samples else None
 
-        # Convert tensors to numpy
-        def to_numpy(x):
+        # Convert tensors to numpy (keep BCHW for B-mode conversion)
+        def to_numpy(x, keep_bchw=False):
             if isinstance(x, torch.Tensor):
                 x = x.detach().cpu().numpy()
-            # Convert from (B, C, H, W) to (B, H, W, C)
-            if x.ndim == 4 and x.shape[1] in [1, 3]:
-                x = x.transpose(0, 2, 3, 1)
-            return np.clip(x, self.vmin, self.vmax)
+            if not keep_bchw:
+                # Convert from (B, C, H, W) to (B, H, W, C)
+                if x.ndim == 4 and x.shape[1] in [1, 3]:
+                    x = x.transpose(0, 2, 3, 1)
+                return np.clip(x, self.vmin, self.vmax)
+            return x
 
-        target = to_numpy(self.target_samples) if self.target_samples is not None else None
-        noisy = to_numpy(self.noisy_samples)
-        denoised = to_numpy(denoised)
+        if display_bmode:
+            from joint_diffusion.utils.bmode import rf_to_bmode, extent_mm
+
+            dynamic_range = tuple(self.config.get("dynamic_range", [-50, 0]))
+
+            def to_bmode(x):
+                if isinstance(x, torch.Tensor):
+                    x = x.detach().cpu().numpy()
+                return rf_to_bmode(x, dynamic_range=dynamic_range)
+
+            target_imgs = to_bmode(self.target_samples) if self.target_samples is not None else None
+            noisy_imgs = to_bmode(self.noisy_samples)
+            denoised_imgs = to_bmode(denoised)
+        else:
+            target = to_numpy(self.target_samples) if self.target_samples is not None else None
+            noisy = to_numpy(self.noisy_samples)
+            denoised = to_numpy(denoised)
 
         # Setup figure
-        n_cols = 3 if target is not None else 2
+        n_cols = 3 if (self.target_samples is not None) else 2
         if noise_samples is not None:
             n_cols += 1
 
-        num_img = len(noisy)
+        num_img = len(self.noisy_samples)
         if figsize is None:
             figsize = (n_cols * 3, num_img * 2)
 
@@ -299,25 +317,40 @@ class Denoiser(abc.ABC):
         titles = []
         samples_list = []
 
-        if target is not None:
-            titles.append("Ground Truth")
-            samples_list.append(target)
-
-        titles.append("Noisy")
-        samples_list.append(noisy)
-
-        titles.append(self.model_names.get(self.name, self.name))
-        samples_list.append(denoised)
-
-        if noise_samples is not None:
-            titles.append("Noise Posterior")
-            samples_list.append(to_numpy(noise_samples))
+        if display_bmode:
+            if target_imgs is not None:
+                titles.append("Ground Truth")
+                samples_list.append(target_imgs)
+            titles.append("Noisy")
+            samples_list.append(noisy_imgs)
+            titles.append(self.model_names.get(self.name, self.name))
+            samples_list.append(denoised_imgs)
+            if noise_samples is not None:
+                titles.append("Noise Posterior")
+                samples_list.append(to_bmode(noise_samples))
+        else:
+            if target is not None:
+                titles.append("Ground Truth")
+                samples_list.append(target)
+            titles.append("Noisy")
+            samples_list.append(noisy)
+            titles.append(self.model_names.get(self.name, self.name))
+            samples_list.append(denoised)
+            if noise_samples is not None:
+                titles.append("Noise Posterior")
+                samples_list.append(to_numpy(noise_samples))
 
         for n in range(num_img):
             for i, (sample, title) in enumerate(zip(samples_list, titles)):
-                img = np.squeeze(sample[n])
-                axs[n, i].imshow(img, cmap="gray", vmin=self.vmin, vmax=self.vmax)
-                axs[n, i].axis("off")
+                if display_bmode:
+                    img = sample[n]
+                    axs[n, i].imshow(img, cmap="gray", vmin=0, vmax=255, extent=extent_mm)
+                    axs[n, i].set_xlabel("X (mm)")
+                    axs[n, i].set_ylabel("Z (mm)")
+                else:
+                    img = np.squeeze(sample[n])
+                    axs[n, i].imshow(img, cmap="gray", vmin=self.vmin, vmax=self.vmax)
+                    axs[n, i].axis("off")
                 if n == 0:
                     axs[n, i].set_title(title)
 
