@@ -1,7 +1,7 @@
 # Training parameters
 epochs:
   desc: Number of epochs to train over
-  value: 200
+  value: 500
 batch_size:
   desc: Size of each mini-batch
   value: 8
