@@ -90,9 +90,28 @@ All outputs go to `outputs/`. Key files:
 - `05_evaluation.png` — GT / reconstruction / difference side-by-side
 - `05_elevation_profile.png` — inter-plane smoothness plot
 
+## Expected Metrics Behavior
+
+The CAMUS sample dataset only contains **2 unique images**. The pseudo-volume cycles them as (A, B, A, B, ...). With `ACCEL_RATE=4`, observed planes (0, 4, 8, 12) are all image A. This causes a bimodal metric distribution:
+
+| Missing plane type | Example planes | PSNR | SSIM | Why |
+|--------------------|---------------|------|------|-----|
+| GT = same as neighbors (image A) | 2, 6, 10, 14 | ~26 dB | ~0.74 | Interpolation + DPS inpainting works well |
+| GT = different from neighbors (image B) | 1, 3, 5, 7, ... | ~12 dB | ~0.11 | All neighbors are image A, GT is image B — unrelated patients |
+
+The ~12 dB floor is not an algorithm failure — it simply measures how different two unrelated patient images are. No reconstruction method can recover image B from observations of image A. The ~26 dB planes confirm the DPS inpainting pipeline works correctly.
+
+With real 3D volumetric data (or more source images creating smoother elevation transitions), all planes would show coherent metrics.
+
 ## Known Limitations
 
-- Pseudo-volumes stack different patients — no real elevation coherence
-- TV smoothness is applied post-hoc, not inside the diffusion loop (paper does it per-step)
+**Data limitations** (CAMUS sample dataset, not the paper's proprietary 3D cardiac data):
+- Only 2 unique source images available — causes bimodal metrics (see above)
+- No real elevation coherence between stacked planes (different patients)
 - Pretrained model is on EchoNet-Dynamic (A4C views), not actual B-plane slices
-- No speckle tracking or out-of-distribution experiments (would need real 3D data)
+- No speckle tracking or out-of-distribution experiments possible without real 3D volumes
+
+**Implementation limitations** (simplifications vs the paper's Algorithm 1):
+- TV smoothness is applied post-hoc, not inside the diffusion loop (paper applies it per-step)
+- Per-plane reconstruction instead of joint volume-level optimization
+- Scanline-based inpainting mask as proxy for the paper's elevation measurement model

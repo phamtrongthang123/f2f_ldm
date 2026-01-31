@@ -52,10 +52,25 @@ target_plane = missing_indices[PLANE_IDX]
 nearest_obs = min(observed_indices, key=lambda x: abs(x - target_plane))
 print(f"Target missing plane: {target_plane}, nearest observed: {nearest_obs}")
 
+# --- Create scanline mask (partial observation, like the paper) ---
+from zea.agent.selection import EquispacedLines
+H, W = model.input_shape[0], model.input_shape[1]
+line_thickness = 2
+scanline_factor = 2
+agent = EquispacedLines(
+    n_actions=W // line_thickness // scanline_factor,
+    n_possible_actions=W // line_thickness,
+    img_width=W,
+    img_height=H,
+)
+_, mask = agent.sample(batch_size=1)
+mask = keras.ops.expand_dims(mask, axis=-1)  # (1, H, W, 1)
+mask = np.array(mask)
+
 # --- Frame 1: Cold start (full 200 steps) ---
 print(f"\n=== Frame 1: Cold start ({N_STEPS} steps) ===")
-measurement_t1 = volume_t1[nearest_obs:nearest_obs+1]  # (1, H, W, C)
-mask = np.ones_like(measurement_t1)
+data_t1 = volume_t1[nearest_obs:nearest_obs+1]  # (1, H, W, C)
+measurement_t1 = np.where(mask, data_t1, -1.0)
 
 t_start = time.time()
 recon_t1 = model.posterior_sample(
@@ -76,7 +91,8 @@ print(f"Recon t1 shape: {recon_t1.shape}, "
 initial_step = N_STEPS - SEQDIFF_TAU  # Skip first 150 steps
 print(f"\n=== Frame 2: SeqDiff warm-start "
       f"(initial_step={initial_step}, running {SEQDIFF_TAU} steps) ===")
-measurement_t2 = volume_t2[nearest_obs:nearest_obs+1]
+data_t2 = volume_t2[nearest_obs:nearest_obs+1]
+measurement_t2 = np.where(mask, data_t2, -1.0)
 
 t_start = time.time()
 recon_t2 = model.posterior_sample(
