@@ -293,18 +293,25 @@ class Denoiser(abc.ABC):
             data_min = getattr(ds, "data_min", None)
             data_max = getattr(ds, "data_max", None)
 
-            def to_bmode(x):
+            def to_bmode(x, label=""):
                 if isinstance(x, torch.Tensor):
                     x = x.detach().cpu().numpy()
+                print(f"[{label}] raw normalized: min={x.min():.6f}, max={x.max():.6f}, mean={x.mean():.6f}, std={x.std():.6f}")
+                x = np.clip(x, self.vmin, self.vmax)
                 x = undo_normalization(
                     x, image_range=(self.vmin, self.vmax),
                     data_min=data_min, data_max=data_max,
                 )
-                return rf_to_bmode(x, dynamic_range=dynamic_range)
+                print(f"[{label}] after undo_norm: min={x.min():.6f}, max={x.max():.6f}, mean={x.mean():.6f}")
+                bmode = rf_to_bmode(x, dynamic_range=dynamic_range)
+                b0 = np.asarray(bmode[0])
+                print(f"[{label}] bmode[0]: min={b0.min()}, max={b0.max()}, mean={b0.mean():.1f}")
+                return bmode
 
-            target_imgs = to_bmode(self.target_samples) if self.target_samples is not None else None
-            noisy_imgs = to_bmode(self.noisy_samples)
-            denoised_imgs = to_bmode(denoised)
+            print(f"[diag] data_min={data_min}, data_max={data_max}, vmin={self.vmin}, vmax={self.vmax}")
+            target_imgs = to_bmode(self.target_samples, "target") if self.target_samples is not None else None
+            noisy_imgs = to_bmode(self.noisy_samples, "noisy")
+            denoised_imgs = to_bmode(denoised, "denoised")
         else:
             target = to_numpy(self.target_samples) if self.target_samples is not None else None
             noisy = to_numpy(self.noisy_samples)
@@ -314,6 +321,8 @@ class Denoiser(abc.ABC):
         n_cols = 3 if (self.target_samples is not None) else 2
         if noise_samples is not None:
             n_cols += 1
+        if display_bmode and self.target_samples is not None:
+            n_cols += 1  # diff column
 
         num_img = len(self.noisy_samples)
         if figsize is None:
@@ -336,7 +345,16 @@ class Denoiser(abc.ABC):
             samples_list.append(denoised_imgs)
             if noise_samples is not None:
                 titles.append("Noise Posterior")
-                samples_list.append(to_bmode(noise_samples))
+                samples_list.append(to_bmode(noise_samples, "noise_post"))
+            # Add diff column: |GT - Denoised| in B-mode pixel space
+            if target_imgs is not None:
+                diff_imgs = []
+                for t, d in zip(target_imgs, denoised_imgs):
+                    ta, da = np.asarray(t, dtype=np.float32), np.asarray(d, dtype=np.float32)
+                    diff = np.abs(ta - da).clip(0, 255).astype(np.uint8)
+                    diff_imgs.append(diff)
+                titles.append("|GT - Denoised|")
+                samples_list.append(diff_imgs)
         else:
             if target is not None:
                 titles.append("Ground Truth")
@@ -352,8 +370,10 @@ class Denoiser(abc.ABC):
         for n in range(num_img):
             for i, (sample, title) in enumerate(zip(samples_list, titles)):
                 if display_bmode:
-                    img = sample[n]
-                    axs[n, i].imshow(img, cmap="gray", vmin=0, vmax=255, extent=extent_mm)
+                    img = np.asarray(sample[n])
+                    is_diff = title.startswith("|")
+                    cmap = "hot" if is_diff else "gray"
+                    axs[n, i].imshow(img, cmap=cmap, vmin=0, vmax=255, extent=extent_mm)
                     axs[n, i].set_xlabel("X (mm)")
                     axs[n, i].set_ylabel("Z (mm)")
                 else:
@@ -367,6 +387,49 @@ class Denoiser(abc.ABC):
 
         if save:
             self.savefig(fig, dpi=dpi, path=save if isinstance(save, (str, Path)) else None)
+
+        # Save raw normalized-space diff figure for debugging scale issues
+        if display_bmode and self.target_samples is not None:
+            target_np = self.target_samples.detach().cpu().numpy() if isinstance(self.target_samples, torch.Tensor) else self.target_samples
+            denoised_np = denoised.detach().cpu().numpy() if isinstance(denoised, torch.Tensor) else denoised
+            num = min(len(target_np), 3)  # show up to 3 samples
+            fig_diff, axes = plt.subplots(num, 4, figsize=(16, num * 3))
+            if num == 1:
+                axes = axes.reshape(1, -1)
+            for n in range(num):
+                # Pick first channel for display
+                gt = target_np[n, 0] if target_np.ndim == 4 else target_np[n]
+                dn = denoised_np[n, 0] if denoised_np.ndim == 4 else denoised_np[n]
+                diff = gt - dn
+
+                im0 = axes[n, 0].imshow(gt, cmap="gray", vmin=self.vmin, vmax=self.vmax)
+                axes[n, 0].set_title(f"GT [{gt.min():.3f}, {gt.max():.3f}]" if n == 0 else f"[{gt.min():.3f}, {gt.max():.3f}]")
+                fig_diff.colorbar(im0, ax=axes[n, 0], fraction=0.046)
+
+                im1 = axes[n, 1].imshow(dn, cmap="gray", vmin=self.vmin, vmax=self.vmax)
+                axes[n, 1].set_title(f"Denoised [{dn.min():.3f}, {dn.max():.3f}]" if n == 0 else f"[{dn.min():.3f}, {dn.max():.3f}]")
+                fig_diff.colorbar(im1, ax=axes[n, 1], fraction=0.046)
+
+                im2 = axes[n, 2].imshow(diff, cmap="RdBu", vmin=-0.5, vmax=0.5)
+                axes[n, 2].set_title(f"GT-Denoised [{diff.min():.3f}, {diff.max():.3f}]" if n == 0 else f"[{diff.min():.3f}, {diff.max():.3f}]")
+                fig_diff.colorbar(im2, ax=axes[n, 2], fraction=0.046)
+
+                im3 = axes[n, 3].imshow(np.abs(diff), cmap="hot", vmin=0, vmax=0.5)
+                axes[n, 3].set_title(f"|diff| [{np.abs(diff).min():.3f}, {np.abs(diff).max():.3f}]" if n == 0 else f"[{np.abs(diff).min():.3f}, {np.abs(diff).max():.3f}]")
+                fig_diff.colorbar(im3, ax=axes[n, 3], fraction=0.046)
+
+                for ax in axes[n]:
+                    ax.axis("off")
+
+            fig_diff.suptitle("Raw normalized-space comparison (channel 0)", fontsize=12)
+            fig_diff.tight_layout()
+            diff_path = str(save if isinstance(save, (str, Path)) else "").replace(".png", "_diff.png") if save else None
+            if not diff_path:
+                diff_path = "figures/debug_diff.png"
+            Path(diff_path).parent.mkdir(parents=True, exist_ok=True)
+            fig_diff.savefig(diff_path, dpi=150, bbox_inches="tight")
+            print(f"Saved diff plot to {diff_path}")
+            plt.close(fig_diff)
 
         return fig
 
@@ -609,6 +672,20 @@ class SGMDenoiser(Denoiser):
 
         with torch.no_grad():
             denoised = self.sampler(y=images, progress_bar=self.verbose)
+
+        # Clamp to training range (same as SGM.sample but that path is bypassed here)
+        lo, hi = self.config.image_range
+        def _clamp(d):
+            if d is None:
+                return d
+            if isinstance(d, list):
+                return [torch.clamp(t, lo, hi) for t in d]
+            return torch.clamp(d, lo, hi)
+
+        if isinstance(denoised, tuple):
+            denoised = tuple(_clamp(d) for d in denoised)
+        else:
+            denoised = _clamp(denoised)
 
         return denoised
 
