@@ -32,7 +32,7 @@ from zea.ops import Pipeline, ScanConvert
 # --- Config ---
 N_STEPS = 200        # T, total diffusion steps (Algo 1 line 25)
 SEQDIFF_TAU = 50     # τ', warm-start step (Algo 1 line 11, 19)
-OMEGA = 35.0         # γ, guidance strength (Eq. 11, eq:dps-linear-4)
+OMEGA = 35.0         # γ, guidance strength (Eq. 12, eq:dps-linear-4)
 PLANE_IDX = 0        # Index into the missing_indices list
 ACCEL_RATE = 4       # Elevation acceleration rate
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")

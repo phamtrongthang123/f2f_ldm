@@ -10,12 +10,12 @@ Implements the paper's volume reconstruction pipeline (Algorithm 1, algo.tex):
 4. Save reconstructed volume
 
 Paper Algorithm 1 → ZEA API mapping:
-  ε_θ(x_τ, τ)           → DiffusionModel (Eq. 3, eq:dsm)
+  ε_θ(x_τ, τ)           → DiffusionModel (Eq. 4, eq:dsm)
   x_τ = α_τ x_0 + σ_τ ε → built-in forward diffusion (Eq. 2, eq:forward-diffusion)
   x_{0|τ} Tweedie       → built-in reverse diffusion (Eq. 3, eq:tweedie)
   y = Ax (measurement)   → inpainting operator (Eq. 5, eq:inverse-problem)
   M = diag(A^T A) (mask) → EquispacedLines scanline mask (Eq. 7, eq:observation_zf)
-  DPS guidance (γ=35)    → posterior_sample(..., omega=35.0) (Eq. 8-11, eq:dps-linear-*)
+  DPS guidance (γ=35)    → posterior_sample(..., omega=35.0) (Eq. 9-12, eq:dps-linear-*)
   TV smoothness (ζ)      → post-hoc TV denoising (Algo 1 line 35-36)
   SeqDiff warm-start     → initial_step, initial_samples (Algo 1 line 16-19)
 
@@ -37,7 +37,7 @@ from zea.agent.selection import EquispacedLines
 # --- Config ---
 ACCEL_RATE = 4       # r ≥ 1, acceleration rate (Eq. 5, eq:inverse-problem)
 N_STEPS = 200        # T, diffusion steps (Algo 1 line 25)
-OMEGA = 35.0         # γ, guidance strength (Eq. 11, eq:dps-linear-4)
+OMEGA = 35.0         # γ, guidance strength (Eq. 12, eq:dps-linear-4)
 ZETA = 0.001         # ζ, smoothness strength (Algo 1 line 36)
 TV_ITERATIONS = 50   # TV denoising iterations (post-hoc approx of Algo 1 line 35-36)
 SCANLINE_FACTOR = 2  # Scanline subsampling factor for inpainting mask
@@ -121,7 +121,7 @@ def reconstruct_plane(model, initial_estimate, agent, n_steps, omega):
 
     measurements = np.where(mask, estimate_batch, -1.0)
 
-    # DPS posterior sampling (Eq. 8-11, eq:bayes-score → eq:dps-linear-4)
+    # DPS posterior sampling (Eq. 8-12, eq:bayes-score → eq:dps-linear-4)
     # Internally: ε_θ predicts noise (Algo 1 line 27), Tweedie denoises (line 28),
     # then guidance corrects x_{0|τ} via measurement error (lines 29-31)
     recon = model.posterior_sample(
