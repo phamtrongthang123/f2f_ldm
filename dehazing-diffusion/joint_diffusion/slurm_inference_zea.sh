@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=infer_zea
 #SBATCH --time=1-00:00:00
-#SBATCH --output=/scrfs/storage/tp030/home/f2f_ldm/slurm_logs/%N_%j.out
+#SBATCH --output=/scrfs/storage/tp030/home/f2f_ldm/slurm_logs/infer_%N_%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
