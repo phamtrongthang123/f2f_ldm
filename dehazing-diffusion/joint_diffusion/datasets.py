@@ -80,6 +80,9 @@ class ZeaDataset(Dataset):
 
         self.data = torch.from_numpy(data.astype(np.float32))
         self.image_range = (lo, hi)
+        self.data_min = float(data_min)
+        self.data_max = float(data_max)
+        self.mu = mu
         self.training = training
 
     def __len__(self):

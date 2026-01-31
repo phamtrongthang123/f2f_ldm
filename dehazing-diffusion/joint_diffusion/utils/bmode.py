@@ -89,6 +89,30 @@ def _single_rf_to_bmode(rf_frame, dynamic_range=(-50, 0)):
     return image
 
 
+def undo_normalization(data, image_range=(-1, 1), mu=255, data_min=None, data_max=None):
+    """Undo ZeaDataset normalization: image_range → mu-law expand → min-max restore.
+
+    Args:
+        data: Normalized data array.
+        image_range: The (lo, hi) range used in step 3 of ZeaDataset.
+        mu: μ-law companding parameter.
+        data_min: Original data minimum (from ZeaDataset.data_min).
+        data_max: Original data maximum (from ZeaDataset.data_max).
+
+    Returns:
+        Data in the original raw RF scale.
+    """
+    lo, hi = image_range
+    # Step 3 inverse: image_range → [-1, 1]
+    data = (data - lo) / (hi - lo) * 2.0 - 1.0
+    # Step 2 inverse: mu-law expand
+    data = np.sign(data) * ((1 + mu) ** np.abs(data) - 1.0) / mu
+    # Step 1 inverse: [-1, 1] → original min-max range
+    if data_min is not None and data_max is not None:
+        data = (data + 1.0) / 2.0 * (data_max - data_min) + data_min
+    return data
+
+
 def rf_to_bmode(rf_data, dynamic_range=(-50, 0)):
     """Convert RF data batch to B-mode images.
 

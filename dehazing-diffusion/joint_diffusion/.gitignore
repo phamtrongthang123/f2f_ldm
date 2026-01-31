@@ -149,3 +149,4 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+sanity_check_output

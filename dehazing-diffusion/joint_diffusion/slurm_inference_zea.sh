@@ -19,6 +19,17 @@ mkdir -p /scrfs/storage/tp030/home/f2f_ldm/slurm_logs
 ROOT_DIR="/scrfs/storage/tp030/home/f2f_ldm"
 SCRIPT_DIR="$ROOT_DIR/dehazing-diffusion/joint_diffusion"
 
+# apptainer exec --nv --writable-tmpfs \
+#   --bind /scrfs/storage/tp030/home:/scrfs/storage/tp030/home \
+#   "$HOME/qwen3vl-cu128.sif" \
+#   bash -c "
+#     set -euo pipefail
+#     source $ROOT_DIR/.venv_joint/bin/activate
+#     cd $SCRIPT_DIR
+
+#   python test_undo_normalization.py
+#   "
+
 apptainer exec --nv --writable-tmpfs \
   --bind /scrfs/storage/tp030/home:/scrfs/storage/tp030/home \
   "$HOME/qwen3vl-cu128.sif" \

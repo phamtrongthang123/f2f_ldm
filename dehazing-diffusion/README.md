@@ -70,6 +70,9 @@ python inference.py -e paper/zea_dehaze_pigdm -t denoise
 
 Output figures are saved to `figures/`. Set `display_bmode: true` in the inference config to get B-mode images (envelope detection + log compression) matching the paper figures.
 
+[Ground Truth] | [Noisy Input] | [Diffusion Output] | [Noise Posterior (optional)]
+    clean tissue    y = tissue+haze   estimated tissue     estimated haze
+
 
 The inference config (`configs/inference/paper/zea_dehaze_pigdm.yaml`) requires:
 - `run_id.sgm`: path to tissue model checkpoint directory

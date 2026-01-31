@@ -284,13 +284,22 @@ class Denoiser(abc.ABC):
             return x
 
         if display_bmode:
-            from utils.bmode import rf_to_bmode, extent_mm
+            from utils.bmode import rf_to_bmode, extent_mm, undo_normalization
 
             dynamic_range = tuple(self.config.get("dynamic_range", [-50, 0]))
+
+            # Get original data scale from dataset for full denormalization
+            ds = getattr(self.dataset, "dataset", None)  # unwrap DataLoader
+            data_min = getattr(ds, "data_min", None)
+            data_max = getattr(ds, "data_max", None)
 
             def to_bmode(x):
                 if isinstance(x, torch.Tensor):
                     x = x.detach().cpu().numpy()
+                x = undo_normalization(
+                    x, image_range=(self.vmin, self.vmax),
+                    data_min=data_min, data_max=data_max,
+                )
                 return rf_to_bmode(x, dynamic_range=dynamic_range)
 
             target_imgs = to_bmode(self.target_samples) if self.target_samples is not None else None
