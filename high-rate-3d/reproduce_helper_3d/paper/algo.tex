@@ -1,0 +1,41 @@
+\algnewcommand{\RequireOptional}{\item[\textbf{Optional:}]}
+\algrenewcommand\algorithmiccomment[1]{\hfill\textcolor{gray!60}{$\triangleright$~#1}}
+\newcommand{\CommentLine}[1]{%
+  \Statex \hspace*{\ALG@thistlm} \textcolor{gray!60}{$\triangleright$~#1}%
+}
+
+\begin{algorithm}
+\caption{3D ultrasound interpolation using \acrshortpl{dm}}
+\begin{algorithmic}[1]
+\Require partial volume $\tY \in \sR^{\tsw{N_\text{el}/r} \times N_\text{az} \times N_\text{ax}}$, subsampling rate \tsw{$r \geq 1$}, measurement matrix $\mA \in \{0,1\}^{\tsw{(N_\text{el} / r)} \times N_\text{el}}$, score model $\rvepsilon_\theta(\cdot)$, guidance strength $\gamma$, diffusion steps $\mathcal{T}$, noise schedule $\alpha_\tau, \sigma_\tau$ for $\tau \in [0, \mathcal{T}]$ (discretized), smoothness strength $\zeta$
+\RequireOptional previous reconstruction $\tX^{\text{prev}}$, accelerated step $\tsw{\tau^\prime}$
+\Ensure reconstructed volume $\tX_0 \in \sR^{N_\text{el} \times N_\text{az} \times N_\text{ax}}$
+
+\CommentLine{Initialization}
+
+  \If{$\tX^{\text{prev}}$ available}
+    \State $\tX_0 \gets \tX^{\text{prev}}$ \Comment{SeqDiff start~\cite{stevens2024sequential}}
+    \State $\tE \sim \mathcal{N}(\mathbf{0}, \tI)$
+    \State $\tX_{\tau} \gets \alpha_{\tsw{\tau^\prime}} \tX_0 + \sigma_{\tsw{\tau^\prime}} \tE$ \Comment{Forward diffusion}
+  \Else
+    \State $\tX_\tau \gets \tX_{\mathcal{T}} \sim \mathcal{N}(\mathbf{0}, \sigma^2_{\mathcal{T}} \tI)$ \Comment{Cold start}
+    \State $\tsw{\tau^\prime} \gets \mathcal{T}$
+  \EndIf
+  \CommentLine{Reverse (guided) diffusion loop}
+  \For{$\tau = \tsw{\tau^\prime}$ to $0$}
+    \For{all \textcolor{ForestGreen}{B planes} $\rvx_\tau, \rvy$ in $\tX_\tau, \tY$ (parallel)}
+    \State $\rvepsilon \gets \rvepsilon_\theta(\rvx_\tau, \tau)$ \Comment{Predict noise}
+    \State $\rvx_{0|\tau} \gets \frac{1}{\alpha_\tau} (\rvx_\tau - \sigma_\tau \rvepsilon)$ \Comment{Denoise (prior)}
+    \State $\mathcal{M} \gets \rvy - \mA \rvx_{0|\tau}$ \Comment{Measurement error}
+    \State $\mathcal{P} \gets \left( \rmI - \sigma_\tau \nabla_{\rvx_\tau} \rvepsilon_\theta(\rvx_\tau, \tau)\right)^T \mA^T$ \Comment{Projection}
+    \State $\rvx_{0|\tau} \gets \rvx_{0|\tau} - \gamma \mathcal{P} \mathcal{M}$ \Comment{Guidance step}
+    \State $\rvx_{\tau-1} \gets \alpha_{\tau-1} \rvx_{0|\tau} + \sigma_{\tau-1} \rvepsilon$ \Comment{Forward diffusion}
+    \EndFor
+    \State $\tX_{\tau - 1} \gets [ \rvx_{\tau - 1}^0, \ldots,  \rvx_{\tau - 1}^{N_{\text{el}}} ]$ \Comment{Stack planes}
+    \State $\mathcal{V} \gets \nabla_{\tX_\tau}\text{TV}_{\text{\textcolor{Lavender}{az}}}(\tX_{\tau-1})$ \Comment{Total variation norm}
+    \State $\tX_{\tau-1} \gets \tX_{\tau-1} - \alpha_{\tau-1} \zeta \mathcal{V}$ \Comment{Smoothness step}
+    \EndFor
+\Return $\tX_0$
+\end{algorithmic}
+\label{algo:interpolation}
+\end{algorithm}

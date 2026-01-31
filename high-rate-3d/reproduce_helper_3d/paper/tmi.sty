@@ -1,0 +1,35 @@
+% \def\logoname{LOGO-tmi-web}
+% \definecolor{subsectioncolor}{rgb}{0,0.541,0.855}
+% \setlength{\firstpagerule}{26.5pc}
+% \setlength{\logowidth}{16.5pc}
+% \def\journalname{IEEE Transactions on Medical Imaging}
+
+% Define a toggle for TMI mode
+\newif\iftmi
+
+% Default to preprint mode
+\tmifalse  % By default, use preprint mode
+
+% Check if TMI mode is enabled from main.tex
+\ifdefined\usetmi
+    \tmitrue
+\fi
+
+% Define colors
+\definecolor{subsectioncolor}{rgb}{0,0.541,0.855}
+\def\logoname{LOGO-tmi-web}
+
+% Apply settings based on mode
+\iftmi
+    % TMI journal settings
+    \setlength{\firstpagerule}{26.5pc}
+    \setlength{\logowidth}{16.5pc}
+    \def\journalname{IEEE Transactions on Medical Imaging}
+    \def\markbothheader{\journalname, VOL. XX, NO. XX, December 2025}
+\else
+    % Preprint settings
+    \setlength{\firstpagerule}{43pc}
+    \setlength{\logowidth}{0pc}
+    \def\journalname{Preprint}
+    \def\markbothheader{Preprint, May 2025}  % Update date as needed
+\fi
