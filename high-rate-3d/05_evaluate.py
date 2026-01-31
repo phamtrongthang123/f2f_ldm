@@ -1,8 +1,13 @@
 """
 05_evaluate.py — Metrics and visualization.
 
-Computes PSNR, SSIM, LPIPS between ground truth and reconstructed volume,
-and generates side-by-side comparison figures (GT | Reconstruction | |Difference|).
+Computes PSNR, SSIM, LPIPS between ground truth and reconstructed volume
+on the missing (reconstructed) elevation planes only. Generates:
+- Side-by-side comparison: GT | Reconstruction | |Difference|
+- Elevation profile: pixel intensity + inter-plane TV along elevation axis
+
+The paper evaluates on B-plane PSNR/LPIPS and A-plane SSIM/LPIPS across
+acceleration rates r ∈ {2, 3, 6, 10} (Section IV, Figures 5-7).
 """
 
 import env_setup  # noqa: F401 — must be first

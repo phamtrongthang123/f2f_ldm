@@ -3,7 +3,12 @@
 
 Loads 2D cardiac echo images from the CAMUS sample dataset (HuggingFace),
 resizes to the diffusion model's input shape, and stacks them as
-"elevation planes" to create pseudo-3D volumes for demonstration.
+"elevation planes" to create pseudo-3D volumes X ∈ R^(N_el, N_az, N_ax)
+(Eq. 1, eq:ultrasound-volume). Two volumes are created with a 1-plane
+offset to simulate consecutive temporal frames for SeqDiff demo.
+
+Note: the paper uses B-mode data in polar coordinates with N_el=48, N_az=64,
+N_ax=400. Here we use N_el=16 planes of 112x112 echonet-dynamic images.
 """
 
 import env_setup  # noqa: F401 — must be first

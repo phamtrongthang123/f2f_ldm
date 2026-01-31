@@ -1,13 +1,20 @@
 """
-04_seqdiff_temporal.py — SeqDiff warm-start demo.
+04_seqdiff_temporal.py — SeqDiff warm-start demo (Algorithm 1, lines 16-23).
 
 Demonstrates temporal acceleration: instead of running full 200-step
 diffusion for every frame, use the previous frame's reconstruction
 as a warm start and run only ~50 steps.
 
-Paper mapping:
-  Cold start (Frame 1):  200 steps, no warm-start
-  SeqDiff (Frame 2):     initial_step=150, initial_samples=recon_t1 → only 50 steps
+Paper Algorithm 1 mapping:
+  Cold start (no X^prev):   X_τ ~ N(0, σ²_T I), τ' ← T       (Algo 1 lines 21-22)
+  SeqDiff (X^prev avail):   X_0 ← X^prev                       (Algo 1 line 17)
+                             X_τ ← α_τ' X_0 + σ_τ' ε           (Algo 1 line 19,
+                                                                  Eq. 2 eq:forward-diffusion)
+                             → runs from τ' instead of T
+
+  Cold start (Frame 1):  n_steps=200, initial_step=0
+  SeqDiff (Frame 2):     n_steps=200, initial_step=150, initial_samples=recon_t1
+                          → only last 50 steps (τ'=50 in paper notation)
   Expected speedup:      ~4x
 """
 
@@ -23,9 +30,9 @@ from zea.models.diffusion import DiffusionModel
 from zea.ops import Pipeline, ScanConvert
 
 # --- Config ---
-N_STEPS = 200        # Full diffusion steps
-SEQDIFF_TAU = 50     # SeqDiff: run only last tau steps
-OMEGA = 35.0         # DPS guidance weight
+N_STEPS = 200        # T, total diffusion steps (Algo 1 line 25)
+SEQDIFF_TAU = 50     # τ', warm-start step (Algo 1 line 11, 19)
+OMEGA = 35.0         # γ, guidance strength (Eq. 11, eq:dps-linear-4)
 PLANE_IDX = 0        # Index into the missing_indices list
 ACCEL_RATE = 4       # Elevation acceleration rate
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")

@@ -1,9 +1,10 @@
 """
 01_verify_prior.py — Verify pretrained diffusion model works.
 
-Loads the pretrained echonet-dynamic diffusion model from ZEA,
-runs unconditional sampling, and saves visualization to verify
-the prior generates plausible cardiac echo frames.
+Loads the pretrained echonet-dynamic diffusion model (the score model
+ε_θ from Eq. 3, eq:dsm) and runs unconditional sampling — i.e. sampling
+from the learned prior p(x) via reverse diffusion (Eq. 2, eq:tweedie).
+Saves visualization to verify the prior generates plausible cardiac echo frames.
 """
 
 import env_setup  # noqa: F401 — must be first

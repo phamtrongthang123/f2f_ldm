@@ -1,7 +1,7 @@
 """
 03_reconstruct_volume.py — Core Algorithm 1: DPS reconstruction of missing planes.
 
-Implements the paper's volume reconstruction pipeline:
+Implements the paper's volume reconstruction pipeline (Algorithm 1, algo.tex):
 1. Load pseudo-volume, subsample along elevation axis (keep every r-th plane)
 2. For each missing plane: interpolate from neighbors, then refine with DPS
    using a partial scanline mask (EquispacedLines) — the model inpaints
@@ -10,12 +10,19 @@ Implements the paper's volume reconstruction pipeline:
 4. Save reconstructed volume
 
 Paper Algorithm 1 → ZEA API mapping:
-  Score model ε_θ        → DiffusionModel.from_preset("diffusion-echonet-dynamic")
-  DPS guidance (γ=35)    → posterior_sample(..., omega=35.0)
-  Inpainting operator A  → built-in (mask kwarg) with EquispacedLines
-  Cosine schedule        → built-in diffusion_schedule()
-  DDIM, T=200 steps      → n_steps=200
-  TV smoothness (ζ)      → post-hoc TV denoising across elevation axis
+  ε_θ(x_τ, τ)           → DiffusionModel (Eq. 3, eq:dsm)
+  x_τ = α_τ x_0 + σ_τ ε → built-in forward diffusion (Eq. 2, eq:forward-diffusion)
+  x_{0|τ} Tweedie       → built-in reverse diffusion (Eq. 3, eq:tweedie)
+  y = Ax (measurement)   → inpainting operator (Eq. 5, eq:inverse-problem)
+  M = diag(A^T A) (mask) → EquispacedLines scanline mask (Eq. 7, eq:observation_zf)
+  DPS guidance (γ=35)    → posterior_sample(..., omega=35.0) (Eq. 8-11, eq:dps-linear-*)
+  TV smoothness (ζ)      → post-hoc TV denoising (Algo 1 line 35-36)
+  SeqDiff warm-start     → initial_step, initial_samples (Algo 1 line 16-19)
+
+Implementation notes vs paper:
+  - Paper applies TV inside the diffusion loop (Algo 1 line 35-36); we do it post-hoc
+  - Paper processes all B-planes in parallel per step (Algo 1 line 26); we do per-plane
+  - Paper uses volume-level measurement matrix A; we use scanline inpainting as proxy
 """
 
 import env_setup  # noqa: F401 — must be first
@@ -28,11 +35,11 @@ from zea.models.diffusion import DiffusionModel
 from zea.agent.selection import EquispacedLines
 
 # --- Config ---
-ACCEL_RATE = 4       # Keep every r-th plane (use 2 for quick test)
-N_STEPS = 200        # Diffusion steps (use 50 for quick test)
-OMEGA = 35.0         # DPS guidance weight (paper: γ=35)
-ZETA = 0.001         # TV smoothness weight
-TV_ITERATIONS = 50   # TV denoising iterations
+ACCEL_RATE = 4       # r ≥ 1, acceleration rate (Eq. 5, eq:inverse-problem)
+N_STEPS = 200        # T, diffusion steps (Algo 1 line 25)
+OMEGA = 35.0         # γ, guidance strength (Eq. 11, eq:dps-linear-4)
+ZETA = 0.001         # ζ, smoothness strength (Algo 1 line 36)
+TV_ITERATIONS = 50   # TV denoising iterations (post-hoc approx of Algo 1 line 35-36)
 SCANLINE_FACTOR = 2  # Scanline subsampling factor for inpainting mask
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
 
@@ -114,7 +121,9 @@ def reconstruct_plane(model, initial_estimate, agent, n_steps, omega):
 
     measurements = np.where(mask, estimate_batch, -1.0)
 
-    # DPS posterior sampling — inpaint missing scanlines
+    # DPS posterior sampling (Eq. 8-11, eq:bayes-score → eq:dps-linear-4)
+    # Internally: ε_θ predicts noise (Algo 1 line 27), Tweedie denoises (line 28),
+    # then guidance corrects x_{0|τ} via measurement error (lines 29-31)
     recon = model.posterior_sample(
         measurements=measurements,
         mask=mask,
@@ -148,6 +157,10 @@ for i, plane_idx in enumerate(missing_indices):
 # --- TV smoothness across elevation ---
 def tv_denoise_elevation(volume, zeta, n_iter):
     """Apply total variation denoising across the elevation dimension.
+
+    Post-hoc approximation of Algo 1 lines 35-36:
+      V ← ∇_{X_τ} TV_az(X_{τ-1})       (line 35)
+      X_{τ-1} ← X_{τ-1} - α_{τ-1} ζ V  (line 36)
 
     Minimizes: ||volume - volume_input||^2 + zeta * TV(volume along elevation)
     Uses iterative gradient descent on the TV penalty.
