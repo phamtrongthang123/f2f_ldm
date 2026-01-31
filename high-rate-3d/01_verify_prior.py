@@ -6,10 +6,9 @@ runs unconditional sampling, and saves visualization to verify
 the prior generates plausible cardiac echo frames.
 """
 
-import os
-os.environ["KERAS_BACKEND"] = "jax"
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+import env_setup  # noqa: F401 — must be first
 
+import os
 import numpy as np
 import keras
 from zea import init_device

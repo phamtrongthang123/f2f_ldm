@@ -16,10 +16,9 @@ Paper Algorithm 1 → ZEA API mapping:
   TV smoothness (ζ)      → post-hoc TV denoising across elevation axis
 """
 
-import os
-os.environ["KERAS_BACKEND"] = "jax"
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+import env_setup  # noqa: F401 — must be first
 
+import os
 import numpy as np
 import keras
 from zea import init_device

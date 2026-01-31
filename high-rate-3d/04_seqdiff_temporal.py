@@ -11,10 +11,9 @@ Paper mapping:
   Expected speedup:      ~4x
 """
 
-import os
-os.environ["KERAS_BACKEND"] = "jax"
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+import env_setup  # noqa: F401 — must be first
 
+import os
 import time
 import numpy as np
 import keras

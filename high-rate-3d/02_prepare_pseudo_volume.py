@@ -6,10 +6,9 @@ resizes to the diffusion model's input shape, and stacks them as
 "elevation planes" to create pseudo-3D volumes for demonstration.
 """
 
-import os
-os.environ["KERAS_BACKEND"] = "jax"
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+import env_setup  # noqa: F401 — must be first
 
+import os
 import numpy as np
 import keras
 from zea import init_device
@@ -60,11 +59,12 @@ for i in range(min(n_needed, len(dataset))):
 
 print(f"Loaded and processed {len(images)} images")
 
-if len(images) < N_ELEVATION + 1:
-    print(f"Warning: only {len(images)} images available, need {N_ELEVATION + 1}.")
-    print("Duplicating images to fill volumes.")
+n_original = len(images)
+if n_original < N_ELEVATION + 1:
+    print(f"Warning: only {n_original} images available, need {N_ELEVATION + 1}.")
+    print("Cycling through available images to fill volumes.")
     while len(images) < N_ELEVATION + 1:
-        images.append(images[len(images) % (N_ELEVATION)])
+        images.append(images[len(images) % n_original])
 
 processed = np.stack(images, axis=0)
 print(f"Processed images shape: {processed.shape}, "

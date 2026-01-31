@@ -7,6 +7,7 @@ SCRIPT_DIR="$ROOT_DIR/high-rate-3d"
 source "$ROOT_DIR/.venv_zea/bin/activate"
 cd "$SCRIPT_DIR"
 export KERAS_BACKEND=jax
+export ZEA_CACHE_DIR="$SCRIPT_DIR/cache"
 
 echo "=== Setting up environment ==="
 

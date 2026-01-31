@@ -5,10 +5,9 @@ Computes PSNR, SSIM, LPIPS between ground truth and reconstructed volume,
 and generates side-by-side comparison figures (GT | Reconstruction | |Difference|).
 """
 
-import os
-os.environ["KERAS_BACKEND"] = "jax"
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+import env_setup  # noqa: F401 — must be first
 
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 import keras
