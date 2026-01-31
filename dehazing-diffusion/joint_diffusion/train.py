@@ -87,9 +87,9 @@ def parse_args():
     return parser.parse_args()
 
 
-def train_epoch(model, dataloader, optimizer, device, epoch, config, callbacks=None):
+def train_epoch(model, dataloader, optimizer, device, epoch, config, ema=None, callbacks=None):
     """Train for one epoch.
-    
+
     Args:
         model: PyTorch model (ScoreNet)
         dataloader: Training DataLoader
@@ -97,53 +97,58 @@ def train_epoch(model, dataloader, optimizer, device, epoch, config, callbacks=N
         device: torch.device
         epoch: Current epoch number
         config: Config object
+        ema: Optional EMAHelper for per-batch updates
         callbacks: Optional CallbackList
-    
+
     Returns:
         Average loss for the epoch
     """
     model.train()
     losses = []
-    
+
     pbar = tqdm.tqdm(
         dataloader,
         desc=f"Epoch {epoch + 1}/{config.epochs}",
         leave=True,
     )
-    
+
     for batch_idx, batch in enumerate(pbar):
         # Handle tuple batches (paired data)
         if isinstance(batch, (tuple, list)):
             batch = batch[0]
-        
+
         batch = batch.to(device)
-        
+
         # Forward pass
         optimizer.zero_grad()
         loss = model.score_loss(batch)
-        
+
         # Backward pass
         loss.backward()
-        
+
         # Gradient clipping (optional)
         if config.get("grad_clip"):
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(), config.grad_clip
             )
-        
+
         optimizer.step()
-        
+
+        # EMA update (per-batch)
+        if ema is not None:
+            ema.update(model)
+
         # Track loss
         loss_val = loss.item()
         losses.append(loss_val)
-        
+
         # Update progress bar
         pbar.set_postfix(loss=f"{loss_val:.4f}")
-        
+
         # Callback
         if callbacks:
             callbacks.on_batch_end(batch_idx, {"loss": loss_val})
-    
+
     return np.mean(losses)
 
 
@@ -216,12 +221,8 @@ def train(config, args):
         
         # Train for one epoch
         epoch_loss = train_epoch(
-            model, train_loader, optimizer, device, epoch, config, callbacks
+            model, train_loader, optimizer, device, epoch, config, ema=ema, callbacks=callbacks
         )
-        
-        # EMA update after each epoch
-        if ema is not None:
-            ema.update(model)
         
         # Learning rate scheduling
         if scheduler is not None:

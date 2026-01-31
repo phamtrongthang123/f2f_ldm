@@ -89,16 +89,7 @@ class ZeaDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        x = self.data[idx]
-        if self.training:
-            # Random horizontal (left-right) flip with 50% probability
-            if torch.rand(1).item() > 0.5:
-                x = torch.flip(x, [-1])
-            # Random brightness offset: uniform ±0.1
-            lo, hi = self.image_range
-            offset = (torch.rand(1).item() - 0.5) * 0.2  # uniform in [-0.1, 0.1]
-            x = (x + offset).clamp_(lo, hi)
-        return x
+        return self.data[idx]
 
 
 def _get_zea_dataset(config, kind: str):
