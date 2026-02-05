@@ -23,7 +23,7 @@ from zea.func import translate
 
 # --- Config ---
 N_ELEVATION = 16  # Number of planes per pseudo-volume (use 8 for quick test)
-DYNAMIC_RANGE = (-40, 0)  # dB dynamic range
+DYNAMIC_RANGE = (-50, 0)  # dB dynamic range
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 

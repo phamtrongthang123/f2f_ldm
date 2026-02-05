@@ -91,6 +91,40 @@ If you diverged in elevation and focused in azimuth, each TX would cover all ele
 
 With Option C, acquiring one elevation plane costs 1 TX. A full volume with N planes costs N TXs. To match the speed of full 3D diverging waves (Option B), you would need to dramatically reduce N — i.e., skip most elevation planes and only acquire every r-th one. The missing planes are then filled in with simple interpolation (or, as this paper proposes, with a diffusion model).
 
+## What Data Does the AI Need for Training?
+
+A key design choice in this paper is that the diffusion model is **2D, not 3D**. It learns what individual B-plane slices (elevation cross-sections) should look like — it does not need to learn the full 3D structure.
+
+Think of it like a CT analogy: if you have a CT volume, you can pull out individual axial slices. Each slice is just a 2D image. You can train a 2D model on a large collection of those slices without ever feeding it a full 3D volume.
+
+Here, it's the same idea. Each 3D ultrasound volume has shape (N_el, N_az, N_ax) = (48, 64, 400). A B-plane is extracted at each azimuth index, giving shape (N_el, N_ax) = (48, 400). So from one volume you get 64 independent 2D training images (one per azimuth position). Across ~100 cine-loops with ~40 frames each, that's roughly 256,000 training images — all just 2D slices.
+
+The data requirements for training:
+- **2D B-plane images** extracted from fully-sampled 3D volumes
+- In **polar coordinates** (before scan conversion to Cartesian)
+- Clipped to **50 dB dynamic range**
+- Normalized to **[-1, 1]**
+
+Why 2D instead of 3D? Three practical reasons:
+1. **Curse of dimensionality** — 3D generative models need vastly more data and compute
+2. **Computational cost** — a 2D U-Net with ~3.9M parameters is lightweight and fast
+3. **Transferability** — in principle, you could leverage existing 2D ultrasound datasets or pretrained models
+
+The 3D consistency between slices is handled at inference time, not training time — the posterior sampling algorithm applies TV (total variation) regularization across the azimuth direction to enforce smoothness between neighboring slices.
+
+### Important: You Need to Train Your Own Prior
+
+The zea toolbox provides a pretrained model `"diffusion-echonet-dynamic"` trained on **Echonet-Dynamic** — a large dataset of apical 4-chamber echocardiography videos. This is convenient for demos, but **it is not a drop-in replacement for the paper's actual model**.
+
+Why? The anatomical appearance in EchoNet images may differ from the paper's B-plane cross-sections. EchoNet shows the heart from apical 4-chamber views. The paper's B-planes are elevation slices through 3D volumes, showing the heart from different orientations. A diffusion model learns the distribution of what it sees — if the training images look different from the target domain, the prior may not transfer well.
+
+To properly reproduce the paper's method, you must:
+1. Acquire fully-sampled 3D volumetric ultrasound data
+2. Extract all B-plane slices (64 per volume)
+3. Train the 2D diffusion model on this B-plane data
+
+The pretrained Echonet model is useful for understanding the API and running quick experiments, but the actual reconstruction quality depends on having a prior trained on data that matches your target domain.
+
 ## What This Paper Does
 
-This paper uses AI (a latent diffusion model) to fill in the gaps from sparse 3D acquisitions. The probe captures only a few widely-spaced planes very quickly, and then the AI reconstructs the missing planes to produce a complete, high-quality 3D volume. This gives you the speed of sparse sampling with the image quality of dense sampling.
+This paper uses AI (a diffusion model) to fill in the gaps from sparse 3D acquisitions. The probe captures only a few widely-spaced planes very quickly, and then the AI reconstructs the missing planes to produce a complete, high-quality 3D volume. This gives you the speed of sparse sampling with the image quality of dense sampling.
