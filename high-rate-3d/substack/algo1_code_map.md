@@ -55,14 +55,14 @@ Maps each line of Algorithm 1 (algo.tex) to `03_reconstruct_volume.py`.
 | 33 | `end for` (B planes) | End of batch loop | line 264 |
 | 34 | Stack planes into `X_{τ-1}` | `volume_noisy = np.transpose(updated_bplanes, (1,0,2,3))` | line 268 |
 | 35 | `V ← ∇ TV_az(X_{τ-1})` | `tv_grad = compute_tv_gradient_azimuth(volume_noisy)` | line 273 |
-| 36 | `X_{τ-1} -= α_{τ-1} ζ V` (smoothness step) | `volume_noisy = volume_noisy - alpha_step * ZETA * tv_grad` | line 275 |
+| 36 | `X_{τ-1} -= α_{τ-1} ζ V` (smoothness step) | `volume_noisy = volume_noisy - alphas[step+1] * ZETA * tv_grad` | line 275 |
 | 37 | `end for` (diffusion steps) | End of `for step in range(start_step, N_STEPS)` | line 243 |
 
 ## Return (line 38)
 
 | Line | Algo 1 | Code | Location |
 |------|--------|------|----------|
-| 38 | `return X_0` | `reconstructed = np.transpose(pred_bplanes, ...)` → `np.save(save_path, reconstructed)` | line 281, 292 |
+| 38 | `return X_0` | `reconstructed = np.transpose(noisy_bplanes, ...)` → `np.save(save_path, reconstructed)` (TV-regularized volume) | line 287, 292 |
 
 ---
 

@@ -227,8 +227,9 @@ else:
     print("Initializing all B-planes with noise (cold start)")
 
 # --- Compute alpha schedule for TV regularization ---
+# Need N_STEPS+1 entries: alphas[step] = α_τ, alphas[step+1] = α_{τ-1}
 alphas = []
-for step in range(N_STEPS):
+for step in range(N_STEPS + 1):
     diffusion_times = np.ones((1, 1, 1, 1)) * model.max_t - step * (model.max_t / N_STEPS)
     _, signal_rates = model.diffusion_schedule(diffusion_times)
     alphas.append(float(np.array(signal_rates)[0, 0, 0, 0]))
@@ -243,14 +244,13 @@ print("Structure: for τ → for all B-planes (batched) → DPS → stack → TV
 for step in range(start_step, N_STEPS):
     # --- Process ALL B-planes for one diffusion step (Algo 1 lines 26-33) ---
     updated_bplanes = np.empty_like(noisy_bplanes)
-    pred_bplanes = np.empty_like(noisy_bplanes)
 
     for batch_start in range(0, N_az, BATCH_SIZE):
         batch_end = min(batch_start + BATCH_SIZE, N_az)
         batch_noisy = noisy_bplanes[batch_start:batch_end]
         batch_meas = measurements_all[batch_start:batch_end]
 
-        batch_updated, batch_pred = one_diffusion_step(
+        batch_updated, _ = one_diffusion_step(
             model,
             batch_noisy,
             batch_meas,
@@ -261,7 +261,6 @@ for step in range(start_step, N_STEPS):
         )
 
         updated_bplanes[batch_start:batch_end] = batch_updated
-        pred_bplanes[batch_start:batch_end] = batch_pred
 
     # --- Stack B-planes into volume (Algo 1 line 34) ---
     # Transpose from (N_az, N_el, N_ax, C) → (N_el, N_az, N_ax, C)
@@ -271,19 +270,19 @@ for step in range(start_step, N_STEPS):
     # V ← ∇_{X_τ} TV_az(X_{τ-1})
     # X_{τ-1} ← X_{τ-1} - α_{τ-1} ζ V
     tv_grad = compute_tv_gradient_azimuth(volume_noisy)
-    alpha_step = alphas[step] if step < len(alphas) else alphas[-1]
+    alpha_step = alphas[step + 1]  # α_{τ-1}: signal rate at next (lower noise) timestep
     volume_noisy = volume_noisy - alpha_step * ZETA * tv_grad
 
     # --- Transpose back to B-planes for next step ---
     noisy_bplanes = np.transpose(volume_noisy, (1, 0, 2, 3))
 
-    # Keep denoised volume for final output
-    reconstructed = np.transpose(pred_bplanes, (1, 0, 2, 3))
-
     # Progress logging
     if (step + 1) % 20 == 0 or step == start_step:
-        tv_val = np.sum(np.abs(np.diff(reconstructed, axis=1)))
+        tv_val = np.sum(np.abs(np.diff(volume_noisy, axis=1)))
         print(f"Step {step+1}/{N_STEPS}: TV={tv_val:.4f}, alpha={alpha_step:.4f}")
+
+# Final output: TV-regularized volume from the last iteration (Algo 1 line 38)
+reconstructed = np.transpose(noisy_bplanes, (1, 0, 2, 3))
 
 print("\nReconstruction complete.")
 
