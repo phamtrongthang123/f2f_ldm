@@ -11,7 +11,7 @@ import env_setup  # noqa: F401 — must be first
 
 import os
 import numpy as np
-import keras
+import jax.numpy as jnp
 from zea import init_device
 from zea.models.diffusion import DiffusionModel
 from zea.ops import Pipeline, ScanConvert
@@ -38,13 +38,16 @@ samples_np = np.array(samples)
 print(f"Samples shape: {samples_np.shape}, range: [{samples_np.min():.3f}, {samples_np.max():.3f}]")
 
 # --- Scan convert + visualize ---
+# Scan conversion params: these define the ultrasound sector geometry.
+# theta_range: angular sweep in radians (0.78 rad ≈ π/4 ≈ 45°, ~90° total FOV).
+# rho_range: normalized depth [0,1].
+# Standard values for echonet-dynamic dataset. The sampled from diffusion is in polor coord. 
 pipeline = Pipeline([ScanConvert(order=2, jit_compile=False)])
 parameters = pipeline.prepare_parameters(
     theta_range=[-0.78, 0.78],
     rho_range=[0, 1],
 )
-
-processed = keras.ops.squeeze(samples, axis=-1)
+processed = jnp.squeeze(samples, axis=-1)
 processed = pipeline(data=processed, **parameters)["data"]
 
 fig, _ = plot_image_grid(

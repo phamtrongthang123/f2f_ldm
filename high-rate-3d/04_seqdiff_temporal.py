@@ -23,7 +23,7 @@ import env_setup  # noqa: F401 — must be first
 import os
 import time
 import numpy as np
-import keras
+import jax.numpy as jnp
 import matplotlib.pyplot as plt
 from zea import init_device
 from zea.models.diffusion import DiffusionModel
@@ -71,7 +71,7 @@ agent = EquispacedLines(
     img_height=H,
 )
 _, mask = agent.sample(batch_size=1)
-mask = keras.ops.expand_dims(mask, axis=-1)  # (1, H, W, 1)
+mask = jnp.expand_dims(mask, axis=-1)  # (1, H, W, 1)
 mask = np.array(mask)
 
 # --- Frame 1: Cold start (full 200 steps) ---

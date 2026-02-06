@@ -4,8 +4,12 @@
 Loads 2D cardiac echo images from the CAMUS sample dataset (HuggingFace),
 resizes to the diffusion model's input shape, and stacks them as
 "elevation planes" to create pseudo-3D volumes X ∈ R^(N_el, N_az, N_ax)
-(Eq. 1, eq:ultrasound-volume). Two volumes are created with a 1-plane
-offset to simulate consecutive temporal frames for SeqDiff demo.
+(Eq. 1, eq:ultrasound-volume). Two volumes are created with a 1-plane offset to simulate consecutive
+temporal frames for the SeqDiff demo (04). This is a demo hack — no real
+temporal 3D data is available, so the offset fakes two similar-but-different
+frames. With real 3D temporal captures you'd have a sequence of volumes
+X(t=0), X(t=1), ... and SeqDiff would warm-start each frame from the
+previous reconstruction.
 
 Note: the paper uses B-mode data in polar coordinates with N_el=48, N_az=64,
 N_ax=400. Here we use N_el=112 planes of 112x112 so B-planes are (112, 112, 1)
@@ -16,7 +20,8 @@ import env_setup  # noqa: F401 — must be first
 
 import os
 import numpy as np
-import keras
+import jax
+import jax.numpy as jnp
 from zea import init_device
 from zea.models.diffusion import DiffusionModel
 from zea.data import Dataset
@@ -55,10 +60,10 @@ for i in range(min(n_needed, len(dataset))):
     img = img[..., np.newaxis]
 
     # Resize to model input shape
-    img = keras.ops.image.resize(img, img_shape)
+    img = jax.image.resize(img, (*img_shape, 1), method="bilinear")
 
     # Normalize: clip to dynamic range, then translate to [-1, 1]
-    img = keras.ops.clip(img, DYNAMIC_RANGE[0], DYNAMIC_RANGE[1])
+    img = jnp.clip(img, DYNAMIC_RANGE[0], DYNAMIC_RANGE[1])
     img = translate(img, DYNAMIC_RANGE, (-1, 1))
 
     images.append(np.array(img))

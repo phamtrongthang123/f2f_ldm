@@ -37,8 +37,7 @@ import env_setup  # noqa: F401 — must be first
 
 import os
 import numpy as np
-import keras
-from keras import ops
+import jax.numpy as jnp
 from zea import init_device
 from zea.models.diffusion import DiffusionModel
 
@@ -123,7 +122,7 @@ def one_diffusion_step(model, noisy_images, measurements, mask, step, n_steps, o
     step_size = model.max_t / n_steps
 
     # Compute diffusion times for current step
-    base_diffusion_times = ops.ones((num_images, *[1] * n_dims)) * model.max_t
+    base_diffusion_times = jnp.ones((num_images, *[1] * n_dims)) * model.max_t
     diffusion_times = base_diffusion_times - step * step_size
     noise_rates, signal_rates = model.diffusion_schedule(diffusion_times)
 
@@ -132,9 +131,9 @@ def one_diffusion_step(model, noisy_images, measurements, mask, step, n_steps, o
     next_noise_rates, next_signal_rates = model.diffusion_schedule(next_diffusion_times)
 
     # Convert to tensors
-    noisy_images_t = ops.convert_to_tensor(noisy_images)
-    measurements_t = ops.convert_to_tensor(measurements)
-    mask_t = ops.convert_to_tensor(mask)
+    noisy_images_t = jnp.asarray(noisy_images)
+    measurements_t = jnp.asarray(measurements)
+    mask_t = jnp.asarray(mask)
 
     # DPS guidance: compute gradients and predictions (Algo 1 lines 27-31)
     gradients, (error, (pred_noises, pred_images)) = model.guidance_fn(
