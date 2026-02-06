@@ -8,7 +8,8 @@ resizes to the diffusion model's input shape, and stacks them as
 offset to simulate consecutive temporal frames for SeqDiff demo.
 
 Note: the paper uses B-mode data in polar coordinates with N_el=48, N_az=64,
-N_ax=400. Here we use N_el=16 planes of 112x112 echonet-dynamic images.
+N_ax=400. Here we use N_el=112 planes of 112x112 so B-planes are (112, 112, 1)
+matching the diffusion model's input shape.
 """
 
 import env_setup  # noqa: F401 — must be first
@@ -22,7 +23,7 @@ from zea.data import Dataset
 from zea.func import translate
 
 # --- Config ---
-N_ELEVATION = 16  # Number of planes per pseudo-volume (use 8 for quick test)
+N_ELEVATION = 112  # Number of planes per pseudo-volume (matches model input for B-plane slicing)
 DYNAMIC_RANGE = (-50, 0)  # dB dynamic range
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
