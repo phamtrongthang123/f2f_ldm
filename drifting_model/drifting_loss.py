@@ -6,6 +6,9 @@ Implements:
 - Drift normalization: normalize drift so E[||V||^2 / C] ≈ 1
 - Multi-temperature aggregation
 - CFG weighting for unconditional samples
+
+Vectorized: compute_V operates on a batched location dimension [L, N, D]
+using torch.cdist's batch support, eliminating the per-location Python loop.
 """
 
 import torch
@@ -15,10 +18,13 @@ import torch.nn.functional as F
 def compute_V(x, y_pos, y_neg, temperature, cfg_weights=None, mask_self=True):
     """Compute the drifting field V (Algorithm 2 from the paper).
 
+    Supports both unbatched [N, D] and batched [L, N, D] inputs.
+    When batched, L is the number of spatial locations processed in parallel.
+
     Args:
-        x: [N, D] generated samples (these are the points we compute V for)
-        y_pos: [N_pos, D] positive (real) samples
-        y_neg: [N_neg, D] negative (generated) samples.
+        x: [N, D] or [L, N, D] generated samples
+        y_pos: [N_pos, D] or [L, N_pos, D] positive (real) samples
+        y_neg: [N_neg, D] or [L, N_neg, D] negative (generated) samples.
                First N entries of y_neg correspond to x (self-pairs to mask).
         temperature: scalar temperature for the kernel
         cfg_weights: [N_neg] optional per-sample weights for CFG.
@@ -26,21 +32,28 @@ def compute_V(x, y_pos, y_neg, temperature, cfg_weights=None, mask_self=True):
         mask_self: if True, mask the first N entries of y_neg as self-pairs
 
     Returns:
-        V: [N, D] drift vectors
+        V: [N, D] or [L, N, D] drift vectors
     """
-    N = x.shape[0]
-    N_pos = y_pos.shape[0]
-    N_neg = y_neg.shape[0]
+    batched = x.dim() == 3
+    if not batched:
+        x = x.unsqueeze(0)
+        y_pos = y_pos.unsqueeze(0)
+        y_neg = y_neg.unsqueeze(0)
 
-    # Pairwise distances
-    dist_pos = torch.cdist(x, y_pos)  # [N, N_pos]
-    dist_neg = torch.cdist(x, y_neg)  # [N, N_neg]
+    L, N, D = x.shape
+    N_pos = y_pos.shape[1]
+    N_neg = y_neg.shape[1]
+
+    # Pairwise distances — cdist supports batch dim [L, N, M]
+    dist_pos = torch.cdist(x, y_pos)  # [L, N, N_pos]
+    dist_neg = torch.cdist(x, y_neg)  # [L, N, N_neg]
 
     # Mask self-distances (x[i] == y_neg[i] for i < N)
     if mask_self and N <= N_neg:
+        # Build [N, N_neg] mask once, broadcast over L
         mask = torch.zeros(N, N_neg, device=x.device, dtype=x.dtype)
         mask[:, :N].fill_diagonal_(1e6)
-        dist_neg = dist_neg + mask
+        dist_neg = dist_neg + mask.unsqueeze(0)  # [1, N, N_neg] broadcast
 
     # Logits
     logit_pos = -dist_pos / temperature
@@ -48,10 +61,10 @@ def compute_V(x, y_pos, y_neg, temperature, cfg_weights=None, mask_self=True):
 
     # Apply CFG weights to logits (weight unconditional samples)
     if cfg_weights is not None:
-        logit_neg = logit_neg + cfg_weights.unsqueeze(0).log()
+        logit_neg = logit_neg + cfg_weights.log().unsqueeze(0).unsqueeze(0)  # [1, 1, N_neg]
 
     # Concatenate for normalization
-    logit = torch.cat([logit_pos, logit_neg], dim=1)  # [N, N_pos + N_neg]
+    logit = torch.cat([logit_pos, logit_neg], dim=2)  # [L, N, N_pos + N_neg]
 
     # Normalize along both dimensions (double normalization)
     A_row = logit.softmax(dim=-1)     # normalize across y
@@ -59,18 +72,21 @@ def compute_V(x, y_pos, y_neg, temperature, cfg_weights=None, mask_self=True):
     A = (A_row * A_col).sqrt()
 
     # Split back
-    A_pos = A[:, :N_pos]   # [N, N_pos]
-    A_neg = A[:, N_pos:]   # [N, N_neg]
+    A_pos = A[:, :, :N_pos]   # [L, N, N_pos]
+    A_neg = A[:, :, N_pos:]   # [L, N, N_neg]
 
     # Compute weights
-    W_pos = A_pos * A_neg.sum(dim=1, keepdim=True)  # [N, N_pos]
-    W_neg = A_neg * A_pos.sum(dim=1, keepdim=True)  # [N, N_neg]
+    W_pos = A_pos * A_neg.sum(dim=2, keepdim=True)  # [L, N, N_pos]
+    W_neg = A_neg * A_pos.sum(dim=2, keepdim=True)  # [L, N, N_neg]
 
-    # Compute drift
-    drift_pos = W_pos @ y_pos  # [N, D]
-    drift_neg = W_neg @ y_neg  # [N, D]
+    # Compute drift: [L, N, N_pos] @ [L, N_pos, D] → [L, N, D]
+    drift_pos = torch.bmm(W_pos, y_pos)
+    drift_neg = torch.bmm(W_neg, y_neg)
 
-    V = drift_pos - drift_neg
+    V = drift_pos - drift_neg  # [L, N, D]
+
+    if not batched:
+        V = V.squeeze(0)
     return V
 
 
@@ -99,13 +115,17 @@ def _feature_normalize(feat_gen, feat_all, eps=1e-8):
 def _drift_normalize(V, eps=1e-8):
     """Drift normalization: scale so E[||V||^2 / C] ≈ 1.
 
+    Normalization is shared across all spatial locations within the same
+    feature map (per appendix_impl.tex:264-267).
+
     Args:
-        V: [N, D] drift vectors
+        V: [L, N, D] drift vectors (L locations, N samples, D dims)
 
     Returns:
-        lambda_j: scalar normalization scale
+        lambda_j: scalar normalization scale (shared across all L locations)
     """
     C = V.shape[-1]
+    # Flatten locations and samples: compute E over all L*N vectors
     # lambda = sqrt(E[||V||^2 / C])
     lam = (V.pow(2).sum(dim=-1).mean() / C).sqrt()
     return lam.clamp(min=eps)
@@ -115,8 +135,8 @@ def _compute_single_feature_loss(feat_gen, feat_pos, feat_neg, feat_unc,
                                   temperatures, cfg_weights):
     """Compute drifting loss for a single feature group.
 
-    Per-location features are handled by iterating over spatial locations.
-    Normalization is shared across all locations within the same feature map.
+    Vectorized: all spatial locations are processed in a single batched call
+    to compute_V, with normalization shared across locations.
 
     Args:
         feat_gen: [N_neg, num_vecs, C] generated features
@@ -150,28 +170,30 @@ def _compute_single_feature_loss(feat_gen, feat_pos, feat_neg, feat_unc,
     else:
         combined_w = None
 
-    # Per-location drift computation with shared normalization and drift norm
-    total_loss = torch.tensor(0.0, device=feat_gen.device)
+    # Reshape to [L, N, C] for batched compute_V (L = num_vecs)
+    # Transpose from [N, L, C] to [L, N, C]
+    g = feat_gen.permute(1, 0, 2) / S  # [L, N_neg, C]
+    p = feat_pos.permute(1, 0, 2) / S  # [L, N_pos, C]
+    n = feat_neg.permute(1, 0, 2) / S  # [L, N_neg, C]
+    u = feat_unc.permute(1, 0, 2) / S  # [L, N_unc, C]
 
-    for loc in range(num_vecs):
-        g = feat_gen[:, loc, :] / S  # [N_neg, C]
-        p = feat_pos[:, loc, :] / S  # [N_pos, C]
-        n = feat_neg[:, loc, :] / S  # [N_neg, C]
-        u = feat_unc[:, loc, :] / S  # [N_unc, C]
+    # Concatenate negatives: [L, N_neg + N_unc, C]
+    y_neg = torch.cat([n, u], dim=1)
 
-        y_neg = torch.cat([n, u], dim=0)  # [N_neg + N_unc, C]
+    # Batched drift computation — one call per temperature
+    V_agg = torch.zeros_like(g)  # [L, N_neg, C]
+    for tau in temperatures:
+        tau_eff = tau * (C ** 0.5)
+        V_tau = compute_V(g, p, y_neg, tau_eff, combined_w)  # [L, N_neg, C]
+        # Drift normalization shared across all L locations (fixes per-location bug)
+        lam = _drift_normalize(V_tau)
+        V_agg = V_agg + V_tau / lam
 
-        V_agg = torch.zeros_like(g)
-        for tau in temperatures:
-            tau_eff = tau * (C ** 0.5)
-            V_tau = compute_V(g, p, y_neg, tau_eff, combined_w)
-            lam = _drift_normalize(V_tau)
-            V_agg = V_agg + V_tau / lam
+    # MSE loss with stop-gradient target
+    target = (g + V_agg).detach()  # [L, N_neg, C]
+    loss = F.mse_loss(g, target) * num_vecs  # multiply by L to match original sum
 
-        target = (g + V_agg).detach()
-        total_loss = total_loss + F.mse_loss(g, target)
-
-    return total_loss
+    return loss
 
 
 def compute_drifting_loss(
@@ -190,8 +212,7 @@ def compute_drifting_loss(
 
     Each feature group is a tensor [B, num_vecs, C] where num_vecs is the
     number of spatial locations (or 1 for global features). The normalization
-    scale is shared across locations within the same feature map, but
-    compute_V is called per location.
+    scale is shared across locations within the same feature map.
 
     Args:
         gen_features: list of [N_neg, num_vecs, C] tensors for generated samples
@@ -221,7 +242,6 @@ def compute_drifting_loss(
     # Vanilla drifting loss on raw latent (without feature encoder)
     if gen_latent is not None and pos_latent is not None:
         N_neg_lat = gen_latent.shape[0]
-        latent_dim = gen_latent.shape[-1]
 
         # Treat the raw latent as a single "feature" with 1 vector of dim latent_dim
         gen_lat_2d = gen_latent.reshape(N_neg_lat, -1).unsqueeze(1)     # [N, 1, D]

@@ -4,11 +4,15 @@ Implements the training loop from Appendix B.6:
 1. Sample N_c class labels
 2. For each class, sample CFG alpha ~ p(alpha) ∝ alpha^{-3}
 3. Generate samples via generator
-4. Decode latents to pixels, extract features
+4. Extract features directly from latents (latent-MAE encoder)
 5. Compute drifting loss
 6. Backprop, update, EMA
 
 Usage:
+    # Single-GPU:
+    python train_imagenet.py --config configs/ablation_default.yaml
+
+    # Multi-GPU:
     torchrun --nproc_per_node=8 train_imagenet.py --config configs/ablation_default.yaml
 """
 
@@ -24,10 +28,9 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
-from diffusers import AutoencoderKL
 
 from models.dit import DiTGenerator, dit_b2, dit_l2
-from models.feature_encoder import MoCoV2FeatureExtractor
+from models.feature_encoder import LatentMAEFeatureExtractor
 from drifting_loss import compute_drifting_loss
 from data.sample_queue import SampleQueue
 from data.imagenet import ImageNetLatentDataset
@@ -92,13 +95,23 @@ def main():
     parser.add_argument("--output_dir", type=str, default="./checkpoints")
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to checkpoint to resume from")
+    parser.add_argument("--bf16", action="store_true",
+                        help="Enable bf16 autocast for forward + loss")
     args = parser.parse_args()
 
-    # DDP setup
-    dist.init_process_group("nccl")
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    # --- DDP / single-GPU setup ---
+    distributed = int(os.environ.get("WORLD_SIZE", 1)) > 1
+
+    if distributed:
+        dist.init_process_group("nccl")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    else:
+        rank = 0
+        world_size = 1
+        local_rank = 0
+
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
 
@@ -130,26 +143,40 @@ def main():
         raise ValueError(f"Unknown architecture: {gen_cfg['arch']}")
 
     generator = generator.to(device)
-    generator_ddp = DDP(generator, device_ids=[local_rank])
+
+    if distributed:
+        generator_ddp = DDP(generator, device_ids=[local_rank])
+    else:
+        generator_ddp = generator
 
     # EMA model
-    ema_generator = copy.deepcopy(generator)
+    gen_module = generator_ddp.module if distributed else generator_ddp
+    ema_generator = copy.deepcopy(gen_module)
     ema_generator.requires_grad_(False)
     ema_generator.eval()
 
-    # VAE (frozen, for decoding latents → pixels)
-    vae_cfg = cfg["vae"]
-    vae = AutoencoderKL.from_pretrained(vae_cfg["model_id"]).to(device)
-    vae.eval()
-    vae.requires_grad_(False)
-    vae_scaling_factor = 0.18215
-
-    # Feature encoder (frozen weights, but gradients flow through)
+    # Feature encoder (frozen, operates on latents directly)
     feat_cfg = cfg["feature_encoder"]
-    feature_encoder = MoCoV2FeatureExtractor(
-        checkpoint_path=feat_cfg.get("checkpoint_path")
+    feature_encoder = LatentMAEFeatureExtractor(
+        checkpoint_path=feat_cfg.get("checkpoint_path"),
+        base_width=feat_cfg.get("base_width", 256),
     ).to(device)
     feature_encoder.eval()
+
+    # VAE — only needed for on-the-fly encoding (not for feature extraction)
+    vae = None
+    vae_scaling_factor = 0.18215
+    dataset_obj = ImageNetLatentDataset(
+        latent_dir=args.latent_dir,
+        imagenet_dir=args.imagenet_dir,
+        split="train",
+    )
+    if dataset_obj.mode == "onthefly":
+        from diffusers import AutoencoderKL
+        vae_cfg = cfg["vae"]
+        vae = AutoencoderKL.from_pretrained(vae_cfg["model_id"]).to(device)
+        vae.eval()
+        vae.requires_grad_(False)
 
     # ---------- Optimizer ----------
     opt_cfg = cfg["optimizer"]
@@ -161,17 +188,19 @@ def main():
     )
 
     # ---------- Data ----------
-    dataset = ImageNetLatentDataset(
-        latent_dir=args.latent_dir,
-        imagenet_dir=args.imagenet_dir,
-        split="train",
-    )
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
-    # We use a simple data loader to feed the sample queue
-    # The actual training batches come from the queue
+    if distributed:
+        sampler = DistributedSampler(dataset_obj, num_replicas=world_size, rank=rank, shuffle=True)
+    else:
+        sampler = None
+
     loader = DataLoader(
-        dataset, batch_size=cfg["queue"]["push_per_step"],
-        sampler=sampler, num_workers=4, pin_memory=True, drop_last=True,
+        dataset_obj,
+        batch_size=cfg["queue"]["push_per_step"],
+        sampler=sampler,
+        shuffle=(sampler is None),
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True,
     )
 
     # Sample queue
@@ -202,7 +231,7 @@ def main():
     start_step = 0
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        generator_ddp.module.load_state_dict(ckpt["generator"])
+        gen_module.load_state_dict(ckpt["generator"])
         ema_generator.load_state_dict(ckpt["ema_generator"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_step = ckpt["step"] + 1
@@ -212,6 +241,7 @@ def main():
     # ---------- Training loop ----------
     data_iter = iter(loader)
     epoch = 0
+    amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if args.bf16 else nullcontext()
 
     if rank == 0:
         pbar = tqdm(range(start_step, total_steps), desc="Training")
@@ -224,7 +254,8 @@ def main():
             batch_data, batch_labels = next(data_iter)
         except StopIteration:
             epoch += 1
-            sampler.set_epoch(epoch)
+            if sampler is not None:
+                sampler.set_epoch(epoch)
             data_iter = iter(loader)
             batch_data, batch_labels = next(data_iter)
 
@@ -233,7 +264,7 @@ def main():
         batch_labels = batch_labels.to(device)
 
         # If data is images (on-the-fly mode), encode to latent
-        if dataset.mode == "onthefly":
+        if dataset_obj.mode == "onthefly" and vae is not None:
             with torch.no_grad():
                 batch_data = vae.encode(batch_data).latent_dist.sample() * vae_scaling_factor
 
@@ -259,7 +290,6 @@ def main():
         alphas = sample_cfg_alpha(n_classes_step, alpha_range, alpha_power, device)
 
         # 3. Process each class with gradient accumulation
-        # This avoids holding all classes in memory simultaneously
         generator_ddp.train()
         optimizer.zero_grad()
 
@@ -295,53 +325,45 @@ def main():
 
             # Use no_sync for all but the last class to skip redundant all-reduce
             is_last = (i == len(class_indices) - 1)
-            sync_ctx = nullcontext() if is_last else generator_ddp.no_sync()
+            if distributed:
+                sync_ctx = nullcontext() if is_last else generator_ddp.no_sync()
+            else:
+                sync_ctx = nullcontext()
+
             with sync_ctx:
-                gen_latent = generator_ddp(noise, labels_batch, alpha_batch, style_indices)
+                with amp_ctx:
+                    gen_latent = generator_ddp(noise, labels_batch, alpha_batch, style_indices)
 
-                # CFG weight for unconditional samples
-                w = compute_cfg_weight(alpha_val, n_neg, n_uncond)
-                cfg_w = torch.ones(n_uncond, device=device) * w
+                    # CFG weight for unconditional samples
+                    w = compute_cfg_weight(alpha_val, n_neg, n_uncond)
+                    cfg_w = torch.ones(n_uncond, device=device) * w
 
-                # 4. Decode latents to pixels for feature extraction
-                gen_pixels = vae.decode(gen_latent / vae_scaling_factor).sample
-                gen_pixels = gen_pixels.clamp(-1, 1)
+                    # Extract features directly from latents (no VAE decode needed)
+                    gen_feats = feature_encoder(gen_latent)
+                    with torch.no_grad():
+                        pos_feats = feature_encoder(pos_latent)
+                        unc_feats = feature_encoder(unc_latent)
+                    neg_feats = gen_feats  # reuse generated features as negatives
 
-                with torch.no_grad():
-                    pos_pixels = vae.decode(pos_latent / vae_scaling_factor).sample.clamp(-1, 1)
-                    unc_pixels = vae.decode(unc_latent / vae_scaling_factor).sample.clamp(-1, 1)
+                    # Flatten latents for vanilla drifting loss
+                    gen_lat_flat = gen_latent.reshape(gen_latent.shape[0], -1)
+                    pos_lat_flat = pos_latent.reshape(pos_latent.shape[0], -1)
+                    neg_lat_flat = gen_lat_flat
+                    unc_lat_flat = unc_latent.reshape(unc_latent.shape[0], -1)
 
-                # Normalize pixels from [-1,1] to [0,1] for MoCo
-                gen_pixels_norm = (gen_pixels + 1) / 2
-                pos_pixels_norm = (pos_pixels + 1) / 2
-                unc_pixels_norm = (unc_pixels + 1) / 2
-
-                # 5. Extract features
-                gen_feats = feature_encoder(gen_pixels_norm)
-                with torch.no_grad():
-                    pos_feats = feature_encoder(pos_pixels_norm)
-                    unc_feats = feature_encoder(unc_pixels_norm)
-                neg_feats = gen_feats  # reuse generated features as negatives
-
-                # Flatten latents for vanilla drifting loss
-                gen_lat_flat = gen_latent.reshape(gen_latent.shape[0], -1)
-                pos_lat_flat = pos_latent.reshape(pos_latent.shape[0], -1)
-                neg_lat_flat = gen_lat_flat
-                unc_lat_flat = unc_latent.reshape(unc_latent.shape[0], -1)
-
-                # 6. Compute drifting loss for this class
-                loss = compute_drifting_loss(
-                    gen_features=gen_feats,
-                    pos_features=pos_feats,
-                    neg_features=neg_feats,
-                    uncond_features=unc_feats,
-                    temperatures=temperatures,
-                    cfg_weights=cfg_w,
-                    gen_latent=gen_lat_flat,
-                    pos_latent=pos_lat_flat,
-                    neg_latent=neg_lat_flat,
-                    uncond_latent=unc_lat_flat,
-                )
+                    # Compute drifting loss for this class
+                    loss = compute_drifting_loss(
+                        gen_features=gen_feats,
+                        pos_features=pos_feats,
+                        neg_features=neg_feats,
+                        uncond_features=unc_feats,
+                        temperatures=temperatures,
+                        cfg_weights=cfg_w,
+                        gen_latent=gen_lat_flat,
+                        pos_latent=pos_lat_flat,
+                        neg_latent=neg_lat_flat,
+                        uncond_latent=unc_lat_flat,
+                    )
 
                 # Gradient accumulation: backward per class, divide by total classes
                 (loss / n_classes_step).backward()
@@ -352,7 +374,7 @@ def main():
         if num_classes_processed == 0:
             continue
 
-        # 7. Gradient clipping and optimizer step
+        # Gradient clipping and optimizer step
         torch.nn.utils.clip_grad_norm_(generator_ddp.parameters(), grad_clip)
 
         # Learning rate warmup
@@ -362,8 +384,8 @@ def main():
 
         optimizer.step()
 
-        # 8. Update EMA
-        update_ema(ema_generator, generator_ddp.module, ema_decay)
+        # Update EMA
+        update_ema(ema_generator, gen_module, ema_decay)
 
         # Logging
         avg_loss = loss_accum / max(num_classes_processed, 1)
@@ -374,7 +396,7 @@ def main():
         if rank == 0 and (step + 1) % train_cfg["checkpoint_every"] == 0:
             ckpt = {
                 "step": step,
-                "generator": generator_ddp.module.state_dict(),
+                "generator": gen_module.state_dict(),
                 "ema_generator": ema_generator.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "config": cfg,
@@ -387,7 +409,7 @@ def main():
     if rank == 0:
         ckpt = {
             "step": total_steps - 1,
-            "generator": generator_ddp.module.state_dict(),
+            "generator": gen_module.state_dict(),
             "ema_generator": ema_generator.state_dict(),
             "optimizer": optimizer.state_dict(),
             "config": cfg,
@@ -395,7 +417,8 @@ def main():
         torch.save(ckpt, os.path.join(args.output_dir, "checkpoint_final.pt"))
         print("Training complete.")
 
-    dist.destroy_process_group()
+    if distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

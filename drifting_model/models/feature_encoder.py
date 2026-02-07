@@ -1,16 +1,16 @@
-"""MoCo v2 ResNet-50 feature encoder with multi-scale feature extraction.
+"""Latent-MAE feature encoder with multi-scale feature extraction.
 
 For latent-space generation, the pipeline is:
-    latent → VAE decoder → pixel image → MoCo ResNet-50 → multi-scale features
+    latent → LatentMAE encoder → multi-scale features
 
 The feature encoder extracts features at multiple scales and spatial granularities
 as described in Appendix B.4 of the paper.
 
-MoCo v2 ResNet-50 stages:
-    conv1 → layer1 (3 bottleneck blocks, 64×64×256)
-           → layer2 (4 bottleneck blocks, 32×32×512)
-           → layer3 (6 bottleneck blocks, 16×16×1024)
-           → layer4 (3 bottleneck blocks, 8×8×2048)
+Latent-MAE ResNet encoder stages (BasicBlocks, GroupNorm, base width C=256):
+    conv1 → stage1 (3 basic blocks, 32×32×C)
+           → stage2 (4 basic blocks, 16×16×2C)
+           → stage3 (6 basic blocks, 8×8×4C)
+           → stage4 (3 basic blocks, 4×4×8C)
 
 Feature extraction: output of every 2 residual blocks + final output per stage.
 For each feature map, produce per-location, global, and patch-level statistics.
@@ -19,74 +19,60 @@ For each feature map, produce per-location, global, and patch-level statistics.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.models as models
+
+from .latent_mae import ResNetEncoder
 
 
-class MoCoV2FeatureExtractor(nn.Module):
-    """Multi-scale feature extractor using pre-trained MoCo v2 ResNet-50."""
+class LatentMAEFeatureExtractor(nn.Module):
+    """Multi-scale feature extractor using pre-trained latent-MAE encoder.
 
-    def __init__(self, checkpoint_path=None):
+    Operates directly on 32×32×4 VAE latents — no VAE decode needed.
+    """
+
+    def __init__(self, checkpoint_path=None, base_width=256):
         super().__init__()
 
-        # ImageNet normalization for MoCo v2
-        self.register_buffer("pixel_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
-        self.register_buffer("pixel_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+        self.encoder = ResNetEncoder(
+            in_channels=4,
+            base_width=base_width,
+        )
 
-        # Load ResNet-50 backbone
-        resnet = models.resnet50(weights=None)
-
-        # Store layers for explicit forward pass
-        self.conv1 = resnet.conv1
-        self.bn1 = resnet.bn1
-        self.relu = resnet.relu
-        self.maxpool = resnet.maxpool
-        self.layer1 = resnet.layer1  # 3 bottleneck blocks → 256 channels
-        self.layer2 = resnet.layer2  # 4 bottleneck blocks → 512 channels
-        self.layer3 = resnet.layer3  # 6 bottleneck blocks → 1024 channels
-        self.layer4 = resnet.layer4  # 3 bottleneck blocks → 2048 channels
-
-        # Load MoCo v2 weights if provided
         if checkpoint_path is not None:
-            self._load_moco_weights(checkpoint_path)
+            self._load_mae_weights(checkpoint_path)
 
-        # Freeze all parameters — we don't train the feature encoder itself,
-        # but gradients flow through it to the generator (via VAE decoder).
-        for param in self.parameters():
-            param.requires_grad = False
+        # Freeze all parameters — gradients flow through to the generator
+        self.requires_grad_(False)
 
-    def _load_moco_weights(self, checkpoint_path):
+    def _load_mae_weights(self, checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        state_dict = checkpoint.get("state_dict", checkpoint)
 
-        # MoCo v2 stores encoder weights with "module.encoder_q." prefix
-        new_state_dict = {}
+        # MAE checkpoint stores encoder under 'ema_model' with 'encoder.' prefix
+        state_dict = checkpoint.get("ema_model", checkpoint.get("model", checkpoint))
+
+        encoder_state = {}
         for k, v in state_dict.items():
-            if k.startswith("module.encoder_q."):
-                new_k = k.replace("module.encoder_q.", "")
-                # Skip FC head
-                if new_k.startswith("fc."):
-                    continue
-                new_state_dict[new_k] = v
+            if k.startswith("encoder."):
+                encoder_state[k[len("encoder."):]] = v
 
-        # Load into the resnet components
-        resnet_state = {}
-        for k, v in new_state_dict.items():
-            resnet_state[k] = v
+        if not encoder_state:
+            # Fallback: try loading directly (in case it's already encoder-only)
+            encoder_state = state_dict
 
-        # Map to our module structure
-        missing, unexpected = self.load_state_dict(resnet_state, strict=False)
+        missing, unexpected = self.encoder.load_state_dict(encoder_state, strict=False)
         if missing:
-            print(f"MoCo v2 loading — missing keys (expected for FC): {missing}")
+            print(f"MAE loading — missing keys: {missing}")
+        if unexpected:
+            print(f"MAE loading — unexpected keys: {unexpected}")
 
     def _get_stage_features(self, stage, x):
         """Run through a stage and extract features every 2 blocks + final.
 
         Args:
-            stage: nn.Sequential of bottleneck blocks
+            stage: nn.Sequential of residual blocks
             x: input tensor
 
         Returns:
-            features: list of (feature_map, H, W, C) at extraction points
+            features: list of feature maps at extraction points
             x: output of the stage
         """
         features = []
@@ -143,11 +129,11 @@ class MoCoV2FeatureExtractor(nn.Module):
 
         return result
 
-    def extract_features(self, images):
-        """Extract multi-scale features from images.
+    def extract_features(self, latents):
+        """Extract multi-scale features from VAE latents.
 
         Args:
-            images: [B, 3, 256, 256] pixel-space images in [0, 1] range
+            latents: [B, 4, 32, 32] VAE-encoded latents
 
         Returns:
             features: list of [B, num_vectors, C] tensors, one per feature group.
@@ -155,42 +141,35 @@ class MoCoV2FeatureExtractor(nn.Module):
         """
         all_features = []
 
-        # ImageNet normalization
-        images = (images - self.pixel_mean) / self.pixel_std
+        # Encoder stem
+        x0 = self.encoder.relu(self.encoder.gn1(self.encoder.conv1(latents)))  # [B, C, 32, 32]
 
-        # Stem
-        x = self.conv1(images)    # [B, 64, 128, 128]
-        x = self.bn1(x)
-        x0 = self.relu(x)        # input layer features
-
-        # (e) For encoder input layer: mean of x^2 per channel → [B, 1, C0]
-        x0_sq_mean = x0.pow(2).mean(dim=[2, 3], keepdim=False).unsqueeze(1)  # [B, 1, 64]
+        # (e) For encoder input layer: mean of x^2 per channel → [B, 1, C]
+        x0_sq_mean = x0.pow(2).mean(dim=[2, 3], keepdim=False).unsqueeze(1)  # [B, 1, C]
         all_features.append(x0_sq_mean)
 
-        x = self.maxpool(x0)     # [B, 64, 64, 64]
-
-        # Stage 1: layer1 — 3 blocks, output 64×64×256
-        feats1, x = self._get_stage_features(self.layer1, x)
+        # Stage 1: 3 basic blocks, 32×32×C
+        feats1, x = self._get_stage_features(self.encoder.stage1, x0)
         for fm in feats1:
             all_features.extend(self._extract_multiscale(fm))
 
-        # Stage 2: layer2 — 4 blocks, output 32×32×512
-        feats2, x = self._get_stage_features(self.layer2, x)
+        # Stage 2: 4 basic blocks, 16×16×2C
+        feats2, x = self._get_stage_features(self.encoder.stage2, x)
         for fm in feats2:
             all_features.extend(self._extract_multiscale(fm))
 
-        # Stage 3: layer3 — 6 blocks, output 16×16×1024
-        feats3, x = self._get_stage_features(self.layer3, x)
+        # Stage 3: 6 basic blocks, 8×8×4C
+        feats3, x = self._get_stage_features(self.encoder.stage3, x)
         for fm in feats3:
             all_features.extend(self._extract_multiscale(fm))
 
-        # Stage 4: layer4 — 3 blocks, output 8×8×2048
-        feats4, x = self._get_stage_features(self.layer4, x)
+        # Stage 4: 3 basic blocks, 4×4×8C
+        feats4, x = self._get_stage_features(self.encoder.stage4, x)
         for fm in feats4:
             all_features.extend(self._extract_multiscale(fm))
 
         return all_features
 
-    def forward(self, images):
+    def forward(self, latents):
         """Alias for extract_features."""
-        return self.extract_features(images)
+        return self.extract_features(latents)
