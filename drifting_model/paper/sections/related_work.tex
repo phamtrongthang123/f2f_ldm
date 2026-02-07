@@ -1,0 +1,32 @@
+\section{Related Work}
+
+\paragraph{Diffusion-/Flow-based Models.}
+Diffusion models (\eg, \citealt{sohl2015deep,ho2020denoising,song2020score}) and their flow-based counterparts (\eg, \citealt{lipman2022flow,liu2022flow,albergo2023stochastic}) formulate noise-to-data mappings through \textit{differential equations} (SDEs or ODEs). At the core of their inference-time computation is an \textit{\mbox{iterative}} update, \eg, of the form $\x_{i+1}=\x_{i} + \Delta\x_{i}$, such as with an Euler solver. The update $\Delta\x_{i}$ depends on the neural network $f$, and as a result, generation involves multiple steps of network evaluations.
+
+A growing body of work has focused on reducing the steps of diffusion-/flow-based models.
+Distillation-based methods 
+(\eg, \citealt{salimans2022progressive,luo2023diff,yin2024one,zhou2024score}) distill a pretrained multi-step model into a single-step one.
+Another line of research  aims to train one-step diffusion/flow models from scratch (\eg, \citealt{song2023consistency,frans2024one,boffi2025flow,geng2025mean}). To achieve this goal, these methods incorporate the SDE/ODE dynamics into training by approximating the induced trajectories.
+In contrast, our work presents a conceptually different paradigm and does not rely on SDE/ODE formulations as in diffusion/flow models.
+
+\paragraph{Generative Adversarial Networks (GANs).}
+GANs \cite{goodfellow2014generative} are a classical family of models that train a generator by discriminating generated samples from real data.
+Like GANs, our method involves a single-pass network $f$ that maps noise to data, whose ``goodness'' is evaluated by a loss function; however, unlike GANs, our method does not rely on adversarial optimization.
+
+\paragraph{Variational Autoencoders (VAEs).}
+VAEs~\cite{kingma2013auto} optimize the evidence lower bound (ELBO), which consists of a reconstruction loss and a KL divergence term.
+Classical VAEs are one-step generators when using a Gaussian prior. Today's prevailing VAE applications often resort to priors learned from other methods, \eg, diffusion \cite{rombach2022high} or autoregressive models \cite{esser2021taming}, where VAEs effectively act as tokenizers.
+
+\paragraph{Normalizing Flows (NFs).}
+NFs~\cite{rezende2015variational,dinh2016density,zhai2024normalizing} learn mappings from data to noise and optimize the log-likelihood of samples.
+These methods require invertible architectures and computable Jacobians. Conceptually, NFs operate as one-step generators at inference, with computation performed by the \mbox{inverse} of the network.
+
+\paragraph{Moment Matching.} 
+Moment-matching methods \cite{dziugaite2015training,li2015generative} seek to minimize the Maximum Mean Discrepancy (MMD) between the generated and data distributions.
+Moment Matching has recently been extended to one-/few-step diffusion \cite{zhou2025inductive}.
+Related to MMD, our approach also leverages the concepts of kernel functions and positive/negative samples. However, our approach focuses on a drifting field that explicitly governs the sample drifts at training time. Further discussion is in \ref{sec:theory_mmd_relation}.
+
+\paragraph{Contrastive Learning.}
+Our drifting field is driven by positive samples from the data distribution and negative samples from the generated distribution.
+This is conceptually related to the positive and negative samples in \textit{contrastive representation learning} \cite{hadsell2006dimensionality,oord2018representation}.
+The idea of contrastive learning has also been extended to generative models, \eg, to GANs~\cite{unterthiner2017coulomb,kang2020contragan} or Flow Matching~\cite{stoica2025contrastive}.

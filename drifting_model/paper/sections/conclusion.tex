@@ -1,0 +1,17 @@
+\section{Discussion and Conclusion}
+
+We present \emph{Drifting Models}, a new paradigm for generative modeling. 
+At the core of our model is the idea of modeling the evolution of pushforward distributions \textit{during training}.
+This allows us to focus on the update rule, \ie, $\x_{i+1} = \x_{i} + \Delta \x_i$, during the iterative training process.
+This is in contrast with diffusion-/flow-based models, which perform the iterative update at \textit{inference} time. Our method naturally performs one-step inference.
+
+Given that our methodology is substantially different, many open questions remain.
+For example, although we show that $q=p \Rightarrow \V=\mathbf{0}$, the converse implication does not generally hold in theory.
+While our designed $\V$ performs well empirically, it remains unclear under what conditions $\V\rightarrow\mathbf{0}$ leads to $q\rightarrow p$.
+
+From a practical standpoint, although our paper presents an effective instantiation of drifting modeling, many of our design decisions may remain sub-optimal. For example, the design of the drifting field and its kernels, the feature encoder, and the generator architecture remain open for future exploration.
+
+From a broader perspective, our work reframes iterative neural network training as a mechanism for distribution evolution, in contrast to the differential equations underlying diffusion-/flow-based models.
+We hope that this perspective will inspire the exploration of other realizations of this mechanism in future work.
+
+\vfill

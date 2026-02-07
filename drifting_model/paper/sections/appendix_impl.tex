@@ -1,0 +1,320 @@
+\clearpage
+\newpage
+\appendix
+\section{Additional Implementation Details}
+\label{sec:appendix_impl}
+
+\cref{tab:hypers_all} summarizes the configurations and hyper-parameters for ablation studies and system-level comparisons. 
+We provide detailed experimental configurations for reproducibility. All ablation studies share a common default setup, while system-level comparisons use scaled-up configurations. More implementation details are described as follows.
+
+\input{tab/config}
+
+\subsection{Pseudo-code for Computing Drifting Field $\V$}
+\label{sec:appendix_compute_V}
+
+Alg.~\ref{alg:drift_code} provides the pseudo-code for computing $\V$. The computation is based on taking empirical means in Eq.~(\ref{eq:VZZ}) and (\ref{eq:kernel}), which are implemented as softmax over $\y$-sample axis. In practice, we further normalize over the $\x$-sample axis, also implemented as softmax on the same logit matrix. 
+We ablate its influence in \ref{sec:appendix_kernel_normalizatio}.
+
+\renewcommand{\yn}{\y^{-}}
+\renewcommand{\yp}{\y^{+}}
+\newcommand{\B}{\mathcal{B}}
+
+It is worth noting that this implementation preserves the desired property of $\V$.
+In principle, this implementation can be viewed as a Monte Carlo estimation of a drifting field:
+\begin{equation}
+\V_{p,q}(\x)=\mathbb E_{\B,p,q}[\tilde K_\B(\x, \yp)\tilde K_\B(\x, \yn)(\yp-\yn)],    
+\end{equation}
+where $\B$ consists of other samples in the batch and $\tilde K_\B$ denote normalizing the distance based on statistics within $\B$. This $\V$ also satisfies $\V_{p,p}(\x)=\mathbf 0$, since when $p=q$, the term  $\tilde K_\B(\yp, x)\tilde K_\B(\yn,x)(\yp-\yn)$ cancels out with the term $\tilde K_\B(\yn, x)\tilde K_\B(\yp,x)(\yn-\yp)$. 
+
+\input{alg/compute_V}
+
+\subsection{Generator Architecture}
+\label{sec:appendix_generator}
+
+\paragraph{Input and output.}
+The input to the generator consists of random noise along with conditioning:
+\[
+f_\theta: (\e, c, \alpha) \mapsto \x
+\]
+where $\e$ denotes random variables, $c$ is a class label, and $\alpha$ is the CFG strength.
+$\e$ may consist of both continuous random variables (\eg, Gaussian noise) and discrete ones (\eg, uniformly distributed integers; see random style embeddings).
+For latent-space models, the output $\mathbf{x} \in \mathbb{R}^{32\times 32\times 4}$ is in the SD-VAE latent space.
+For pixel-space models, the output $\mathbf{x} \in \mathbb{R}^{256\times 256\times 3}$ is directly an image.
+
+\paragraph{Transformer.}
+We adopt a DiT-style Transformer~\citep{peebles2023scalable}. Following~\citep{yao2025reconstruction}, we use SwiGLU~\citep{shazeer2020glu}, RoPE~\citep{su2024roformer}, RMSNorm~\citep{zhang2019root}, and QK-Norm~\citep{henry2020query}.
+The input Gaussian noise is patchified into 256$=$16$\times$16 tokens (patch size 2$\times$2 for latent, 16$\times$16 for pixel).
+Conditioning $(c, \alpha)$ is processed by adaLN, as well as by in-context conditioning tokens.
+The output tokens are unpatchified back to the target shape.
+
+\paragraph{In-context tokens.}
+Following~\cite{li2025back}, we prepend 16 learnable tokens to the sequence for in-context conditioning \cite{peebles2023scalable}.
+These tokens are formed by summing the projected conditioning vector with positional embeddings.
+\paragraph{Random style embeddings.}
+Our framework allows arbitrary noise distributions beyond Gaussians.
+Inspired by StyleGAN~\cite{sauer2022stylegan}, we introduce an additional 32 ``style tokens'': each of which is a random index into a codebook of 64 learnable embeddings.
+These are summed and added to the conditioning vector.
+This does not change the sequence length and introduces negligible overhead in terms of parameters and FLOPs. This table reports the effect of style embeddings on our ablation default:
+
+\begin{center}
+\tablestyle{6pt}{1.02}
+\tablefontsize
+\begin{tabular}{c|cc}
+\toprule
+ & w/o style & w/ style \\
+\midrule
+FID & 8.86 & \textbf{8.46} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+In contrast to diffusion-/flow-based methods, our method can naturally handle different types of noise or random variables.
+With random style embeddings, the input random variables consist of two parts: (1) Gaussian noise, and (2) discrete indices for style embeddings. Our model $f$ produces the pushforward distribution of their joint distribution. 
+
+%============================================================
+% MAE Implementation
+%============================================================
+\subsection{Implementation of ResNet-style MAE}
+\label{sec:appendix_latent_mae}
+
+In addition to standard self-supervised learning models (MoCo \cite{he2020momentum}, SimCLR\cite{chen2020simple}), we develop a customized ResNet-style MAE model as the feature encoder for drifting loss.
+
+\paragraph{Overview.}
+Unlike standard MAE \cite{he2022masked}, which is based on ViT \cite{Dosovitskiy2021}, our MAE trains a convolutional ResNet that provides multi-scale features.
+For latent-space models, the input and output have dimension 32$\times$32$\times$4;
+for pixel-space models, the input and output have dimension 256$\times$256$\times$3.
+
+Our MAE consists of a ResNet-style encoder paired with a deconvolutional decoder in a U-Net-style \cite{ronneberger2015u} encoder-decoder architecture.
+We only use the ResNet-style encoder for feature extraction when computing the drifting loss.
+
+\paragraph{MAE Encoder.}
+The encoder follows a classical ResNet \cite{he2016deep} design.
+It maps an input to multi-scale feature maps (4 scales in ResNet):
+\[
+\text{Encoder}: \mathbf{x} \mapsto \{\mathbf{f}_1, \mathbf{f}_2, \mathbf{f}_3, \mathbf{f}_4\}
+\]
+Here, a feature map $\mathbf{f}_i$ has dimension $H_i{\times}W_i{\times}C_i$, with $H_i{\times}W_i \in \{32^2, 16^2, 8^2, 4^2\}$ and $C_i \in \{C, 2C, 4C, 8C\}$ for a base width $C$.
+
+The architecture follows standard ResNet~\citep{he2016deep} design, with GroupNorm (GN)~\citep{wu2018group} used in place of BatchNorm (BN)~\citep{ioffe2015batch}.
+All residual blocks are ``basic'' blocks (\ie, each consisting of two $3{\times}3$ convolutions).
+Following the standard ResNet-34 \citep{he2016deep}: 
+the encoder has a 3${\times}$3 convolution (without downsampling) and 4 stages with $[3, 4, 6, 3]$ blocks; downsampling (stride 2) happens at the first block of stages 2 to 4.
+
+For latent-space (\ie, latent-MAE), the input of this ResNet is 32$\times$32$\times$4; for pixel-space, the 256$\times$256$\times$3 input is first patchified (by a 8$\times$8 patch) into 32$\times$32$\times$192. The ResNet operates on the input with $H{\times}W$ $=$ 32$\times$32.
+
+\paragraph{MAE Decoder.}
+The decoder returns to the input shape via deconvolutions and skip connections:
+\[
+\text{Decoder}: \{\mathbf{f}_4, \mathbf{f}_3, \mathbf{f}_2, \mathbf{f}_1\} \mapsto \hat{\mathbf{x}}.
+\]
+
+It starts with a $3{\times}3$ convolutional block on $\mathbf{f}_4$, followed by 4 upsampling blocks.
+Each upsampling block performs: bilinear 2${\times}$2 upsampling $\to$ concatenating with encoder's skip connection $\to$ GN $\to$ two $3{\times}3$ convolutions with GN and ReLU.
+A final 1${\times}$1 convolution produces the output channels. For the pixel-space, the decoder unpatchifies back to the original resolution after the last layer.
+
+\paragraph{Masking.}
+The MAE is trained to reconstruct randomly masked inputs.
+Unlike the ViT-based MAE~\citep{he2022masked}, which removes the masked tokens from the sequence, we simply zero out masked patches.
+For the input of a shape $H{\times}W$ $=$ 32$\times$32 (in either the latent- or pixel-based case), we mask 2${\times}$2 patches by zeroing.
+Each patch is independently masked with 50\% probability.
+
+\paragraph{MAE training.}
+We minimize the $\ell_2$ reconstruction loss on the masked regions.
+We use AdamW \cite{Loshchilov2019} with learning rate $4{\times}10^{-3}$ and a batch size of 8192. EMA with decay 0.9995 is used.
+Following \cite{he2022masked}, we apply random resized crop augmentation to the input (for the latent setting, images are augmented before being passed through the VAE encoder).
+
+\paragraph{Classification fine-tuning.}
+For our best feature encoder (last row of Table~\ref{tab:ablation_drift_space}), we fine-tune the MAE model with a linear classifier head.
+The loss is $\lambda \mathcal{L}_{\text{cls}} + (1-\lambda)\mathcal{L}_{\text{recon}}$. We fine-tune all parameters in this MAE for 3k iterations, where $\lambda$ follows a linear warmup schedule, increasing from $0$ to $0.1$ over the first 1k iterations and remaining constant at $0.1$ for the rest of the training.
+
+
+%============================================================
+% Other Feature Encoders
+%============================================================
+\subsection{Other Pretrained Feature Encoders}
+\label{sec:appendix_other_encoders}
+
+In addition to our customized MAE, we also evaluate other feature encoders for computing the drifting loss.
+
+\paragraph{MoCo and SimCLR.} We evaluate publicly available self-supervised encoders trained on ImageNet in pixel space: MoCo \cite{he2020momentum,chen2020improved} SimCLR \cite{chen2020simple}. We use the ResNet-50 variant. 
+For latent-space generation, we apply the VAE decoder to map generator outputs from latent space (32${\times}$32${\times}$4) to pixel space (256${\times}$256${\times}$3) before feature extraction.
+Gradients are backpropagated through both the feature extractor and the VAE decoder.
+
+\paragraph{MAE with ConvNeXt-V2.} In our pixel-space generator, we also investigate ConvNeXt-V2 \citep{woo2023convnext} as the feature encoder. We note that ConvNeXt-V2 is a self-supervised pre-trained model using the MAE objective, followed by classification fine-tuning. Like ResNet, ConvNeXt-V2 is a multi-stage architecture.
+
+%============================================================
+% Feature Extraction Details
+%============================================================
+\subsection{Multi-scale Features for Drifting Loss}
+\label{sec:appendix_feature_extraction}
+
+Given an image, the feature encoder produces feature maps at multiple scales, with multiple spatial locations per scale.
+We compute one drifting loss per feature (\eg, per scale and/or per location).
+Specifically, we compute the kernel, the drift, and the resulting loss independently for each feature. The resulting losses are summed.
+
+For each stage in a ResNet, we extract features from the output of every 2 residual blocks, together with the final output.
+This yields a set of feature maps, each of shape $H_i{\times}W_i{\times}C_i$. For each feature map, we produce:
+\begin{enumerate}[itemsep=2pt, topsep=2pt, parsep=4pt, partopsep=4pt,label=(\alph*)]
+    \item $H_i{\times}W_i$ vectors, one per location (each $C_i$-dim);
+    \item 1 global mean and 1 global std (each $C_i$-dim);
+    \item $\frac{H_i}{2}{\times}\frac{W_i}{2}$ vectors of means and $\frac{H_i}{2}{\times}\frac{W_i}{2}$ vectors of stds (each $C_i$-dim), computed over 2${\times}$2 patches;
+    \item $\frac{H_i}{4}{\times}\frac{W_i}{4}$ vectors of means and $\frac{H_i}{4}{\times}\frac{W_i}{4}$ vectors of stds (each $C_i$-dim), computed over 4${\times}$4 patches.
+\end{enumerate}
+In addition, for the encoder's input ($H_0{\times}W_0{\times}C_0$), we compute the mean of squared values ($x^2$) per channel and obtain a $C_0$-dim vector.
+
+All resulting vectors here are $C_i$-dim.
+We compute one drifting loss for each of these $C_i$-dim vectors. All these losses, in addition to the vanilla drifting loss without $\phi$, are summed.
+This table compares the effect of these designs on our ablation default:
+\begin{center}
+\tablestyle{6pt}{1.02}
+\tablefontsize
+\begin{tabular}{c|ccc}
+\toprule
+ & (a,b) & (a-c) & (a-d) \\
+\midrule
+FID & 9.58 & 9.10 & \textbf{8.46} \\
+\bottomrule
+\end{tabular}
+\end{center}
+This shows that our method benefits from richer feature sets.
+We note that once the feature encoder is run, the computational cost of our drifting loss is negligible: computing multi-scale, multi-location losses incurs little overhead compared to computing a single loss.
+
+
+\subsection{Feature and Drift Normalization}
+\label{sec:appendix_feature_and_loss_normalization}
+
+To balance the multiple loss terms from multiple features, we perform normalization for each feature $\phi_j$, where, $\phi_j$ denotes a feature at a specific spatial location within a given scale (see \ref{sec:appendix_feature_extraction}). 
+Intuitively, we want to perform normalization such that the kernel $k(\cdot, \cdot)$ and the drift $\V$ are insensitive to the absolute magnitude of features.
+This allows our model to robustly support different feature encoders (see Table~\ref{tab:ablation_drift_space}) as well as a rich set of features from one encoder.
+
+\paragraph{Feature Normalization.} Consider a feature $\phi_j \in \mathbb{R}^{C_j}$. We define a normalization scale $S_j \in \mathbb{R}^{1}$ and the normalized feature is denoted by:
+\begin{equation}
+\tilde{\phi}_j := {\phi}_j / S_j.
+\end{equation}
+When using $\tilde{\phi}_j$, the $\ell_2$ distance computed in Eq.~(\ref{eq:kernel}) is:
+\begin{equation}
+dist_j(\x, \y) = \|\tilde{\phi}_j(\x) - \tilde{\phi}_j(\y)\|,
+\end{equation}
+where $\x$ denotes a generated sample and $\y$ denotes a positive/negative sample, and $\tilde{\phi}_j(\cdot)$ means extracting their feature at $j$. We want the \textit{average} distance to be $\sqrt{C_j}$:
+\begin{equation}
+\mathrm{E}_\x \mathrm{E}_\y [ dist_j(\x, \y)] \approx \sqrt{C_j}.
+\end{equation}
+To achieve this, we set the normalization scale $S_j$ as:
+\begin{equation}
+S_j = \frac{1}{\sqrt{C_j}} \mathrm{E}_\x \mathrm{E}_\y [ \|{\phi}_j(\x) - {\phi}_j(\y)\| ]
+\end{equation}
+In practice, we use all $\x$ and $\y$ samples in a batch to compute the empirical mean in place of the expectation. We reuse the \texttt{cdist} computation in Alg.~\ref{alg:drift_code} for computing the pairwise distances. We apply stop-gradient to $S_j$, because this scalar is conceptually computed from samples from the previous batch.
+
+With the normalized feature, the kernel in Eq.~(\ref{eq:kernel}) is set as:
+\begin{equation}
+k(\x, \y) = \exp\left(-\frac{1}{\tilde{\tau_j}} \|\tilde{\phi}_j(\x) - \tilde{\phi}_j(\y)\|\right),
+\end{equation}
+where $\tilde{\tau_j}:=\tau{\cdot}\sqrt{C_j}$. By doing so, the value of temperature $\tau$ does not depend on the feature magnitude or feature dimensionality. We set $\tau \in$ \{0.02, 0.05, 0.2\} (discussed next).
+
+\paragraph{Drift Normalization.} When using the feature $\phi_j$, the resulting drift is in the same feature space as $\phi_j$, denoted as $\V_j$. We perform a drift normalization on $\V_j$, for each feature $\phi_j$. Formally, we define a normalization scale $\lambda_j \in \mathbb{R}^1$ and denote:
+\begin{equation}
+\tilde{\V}_j:=\V_j / \lambda_j.
+\end{equation}
+Again, we want the normalized drift to be insensitive to the feature magnitude:
+\begin{equation}
+\mathbb{E} \left[ \frac{1}{C_j}\| \tilde{\V}_j \|^2 \right] \approx 1.
+\end{equation}
+To achieve this, we set $\lambda_j$ as:
+\begin{equation}
+\label{eq:lambda}
+\lambda_j = \sqrt{\mathbb{E} \left[ \frac{1}{C_j} \| \V_j \|^2 \right]}.
+\end{equation}
+In practice, the expectation is replaced with the empirical mean computed over the entire batch.
+
+With the normalized feature and normalized drift, the drifting loss of the feature $\phi_j$ is:
+\begin{equation}
+\label{eq:mse_loss_j}
+\mathcal{L}_j = \text{MSE}(\tilde\phi_j({\x}) -  \texttt{sg}(\tilde\phi_j({\x}) + \tilde{\V}_j)),
+\end{equation}
+where MSE denotes mean squared error.
+The overall loss is the sum across all features:
+$\mathcal{L} = \sum_j {\mathcal{L}_j}$.
+
+\paragraph{Multiple temperatures.}
+Using normalized feature distances, the value of temperature $\tau$ determines \textit{what is considered ``nearby''}.
+To improve robustness across different features and across different pretrained models we study, we adopt multiple temperatures.
+
+Formally, for each $\tau$ value, we compute the normalized drift as described above, denoted by $\tilde{\V}_{j,\tau}$. Then we compute an aggregated field: $\tilde{\V}_j \leftarrow \sum_\tau \tilde{\V}_{j,\tau}$, and use it for the loss in \cref{eq:mse_loss_j}. 
+
+% and renormalize it in the same way as Eq.~(\ref{eq:lambda}):
+% $\hat{\V}_j \leftarrow \hat{\V}_j / \hat{\lambda}_j$.
+% This $\hat{\V}_j$ is used in place of $\tilde{\V}_j$ in ().
+
+This table shows the effect of multiple temperatures on our ablation default:
+\begin{center}
+    \tablestyle{4pt}{1.05}
+    \tablefontsize
+    \begin{tabular}{l | x{32} x{32} x{32} | c}
+    \toprule
+    $\tau$ & 0.02 & 0.05 & 0.2 & \{0.02, 0.05, 0.2\} \\
+    \midrule
+    FID & 10.62 & \textbf{8.67} & 8.96 & \textbf{8.46} \\
+    \bottomrule
+    \end{tabular}
+\end{center}
+Using multiple temperatures can achieve slightly better results than using a single optimal temperature. We fix $\tau \in $ \{0.02, 0.05, 0.2\} and do not require tuning this hyperparameter across different configurations.
+
+
+\paragraph{Normalization across spatial locations.}
+For a feature map of resolution $H_i{\times}W_i$, there are $H_i{\times}W_i$ per-location features.
+Separately computing the normalization for each location would be slow and unnecessary.
+We assume that features at different locations within the same feature map share the same normalization scale. Accordingly, we concatenate all $H_i{\times}W_i$ locations and compute the normalization scale over all of them.
+The feature normalization and drift normalization are both performed in this way.
+
+
+\subsection{Classifier-Free Guidance (CFG)}
+\label{sec:appendix_cfg}
+
+To support CFG, at training time, we include $N_\text{unc}$ additional \mbox{unconditional} samples (real images from random classes) as extra negatives.
+These samples are weighted by a factor $w$ when computing the kernel.
+For a generated sample $\x$, the effective negative distribution it compares with is:
+\[
+\tilde{q}(\cdot|c) \triangleq \frac{(N_\text{neg}{-}1) \cdot q_\theta(\cdot|c) + N_\text{unc}  w \cdot p_{\text{data}}(\cdot|\varnothing)}{(N_\text{neg}{-}1) + N_\text{unc} w}.
+\]
+Comparing this equation with Eq.~(\ref{eq:cfg1})(\ref{eq:cfg2}), we have:
+\[
+\gamma = \frac{N_\text{unc} w}{(N_\text{neg}{-}1) + N_\text{unc} w}
+\]
+and 
+\[
+\alpha = \frac{1}{1-\gamma} = \frac{(N_\text{neg}{-}1) + N_\text{unc} w}{N_\text{neg}{-}1}.
+\]
+Given a CFG strength $\alpha$, we compute $w$ accordingly, which is used to weight the kernel.
+The same weighting $w$ is also applied when computing the global distance normalization.
+
+We train our model with CFG-conditioning \cite{geng2025improved}. At each iteration, we randomly sample $\alpha$ following a pre-defined distribution (see Table~\ref{tab:hypers_all}) and compute the resulting $w$ for weighting the unconditional samples. The value of $\alpha$ is a condition input to the network $f_\theta(\e, c, \alpha)$, alongside the class label $c$.
+
+At inference time, we specify a value of $\alpha$. The inference-time computation remains to be one-step (1-NFE).
+
+\subsection{Sample Queue}
+\label{sec:appendix_sample_queue}
+
+Our method requires access to randomly sampled \textit{real} (positive/unconditional) data. This can be implemented using a specialized data loader. 
+Instead, we adopt a \textit{sample queue} of cached data, similar to the queue used in MoCo \cite{he2020momentum}.
+This implementation samples data in a statistically similar way to a specialized data loader.
+For completeness, we describe our implementation as follows, while noting that a data loader would be a more principled solution.  
+
+For each class label, we keep a queue of size 128; for unconditional samples (used in CFG), we maintain a separate global queue of size 1000.
+At each training step, we push the latest 64 new real (positive/unconditional) samples, alongside their labels, into the corresponding queues; the earliest ones are dequeued.
+When sampling, positive samples are drawn from the queue of the corresponding class, and unconditional samples are drawn from the global queue.
+We sample without replacement.
+
+\subsection{Training Loop}
+\label{sec:appendix_training_loop}
+
+In summary, in the training loop, each step proceeds as:
+\begin{enumerate}[itemsep=2pt, topsep=2pt, parsep=2pt, partopsep=2pt]
+    \item Sample a batch ($N_c$) of class labels.
+    \item For each label $c$, sample a CFG scale $\alpha$.
+    \item Sample a batch ($N_\text{neg}$) of noise $\e$. Feed $(\e, c, \alpha)$ to the generator $f$ to produce generated samples;
+    \item Sample positive samples (same class, $N_\text{pos}$) and unconditional samples (for CFG, $N_\text{unc}$);
+    \item Extract features on all generated, positive, and unconditional samples
+    \item Compute the drifting loss using the features.
+    \item Run backpropagation and parameter update.
+\end{enumerate}
+
