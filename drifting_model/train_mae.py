@@ -24,7 +24,9 @@ import math
 import argparse
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 
 from models.latent_mae import LatentMAE
@@ -63,14 +65,29 @@ def main():
     parser.add_argument("--ema_decay", type=float, default=0.9995)
     parser.add_argument("--warmup_epochs", type=int, default=10)
     parser.add_argument("--resume", type=str, default=None)
-    parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--save_every", type=int, default=10,
                         help="Save checkpoint every N epochs")
     args = parser.parse_args()
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    device = torch.device(args.device)
+    # --- DDP Setup ---
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        dist.init_process_group("nccl")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ["LOCAL_RANK"])
+        device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(device)
+        print(f"Initialized DDP: rank {rank}/{world_size}, local_rank {local_rank}")
+    else:
+        rank = 0
+        world_size = 1
+        local_rank = 0
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Running in single-process mode on {device}")
+
+    if rank == 0:
+        os.makedirs(args.output_dir, exist_ok=True)
 
     # --- Model ---
     model = LatentMAE(
@@ -79,7 +96,10 @@ def main():
         mask_ratio=0.5,
     ).to(device)
 
-    ema_model = copy.deepcopy(model)
+    if world_size > 1:
+        model = DDP(model, device_ids=[local_rank])
+
+    ema_model = copy.deepcopy(model.module if world_size > 1 else model)
     ema_model.requires_grad_(False)
     ema_model.eval()
 
@@ -98,10 +118,13 @@ def main():
         split="train",
     )
 
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
+
     loader = DataLoader(
         dataset,
         batch_size=args.micro_batch,
-        shuffle=True,
+        sampler=sampler,
+        shuffle=(sampler is None),
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
@@ -116,16 +139,26 @@ def main():
     )
 
     # --- Schedule ---
-    accum_steps = args.effective_batch // args.micro_batch
+    # Effective batch = micro_batch * world_size * accum_steps
+    global_batch_per_step = args.micro_batch * world_size
+    accum_steps = args.effective_batch // global_batch_per_step
+    if accum_steps < 1:
+        accum_steps = 1
+        if rank == 0:
+            print(f"Warning: Effective batch {args.effective_batch} < actual batch {global_batch_per_step}. Using accum_steps=1.")
+
     steps_per_epoch = len(loader) // accum_steps
     total_steps = args.epochs * steps_per_epoch
     warmup_steps = args.warmup_epochs * steps_per_epoch
     vae_scaling_factor = 0.18215
 
-    print(f"Dataset size: {len(dataset)}")
-    print(f"Micro-batch: {args.micro_batch}, Accum steps: {accum_steps}")
-    print(f"Steps per epoch: {steps_per_epoch}, Total steps: {total_steps}")
-    print(f"Warmup steps: {warmup_steps}")
+    if rank == 0:
+        print(f"Dataset size: {len(dataset)}")
+        print(f"Micro-batch per GPU: {args.micro_batch}, World size: {world_size}")
+        print(f"Global batch per fwd: {global_batch_per_step}, Accum steps: {accum_steps}")
+        print(f"Effective batch: {global_batch_per_step * accum_steps}")
+        print(f"Steps per epoch: {steps_per_epoch}, Total steps: {total_steps}")
+
 
     # --- Resume ---
     start_epoch = 0
@@ -143,12 +176,19 @@ def main():
     scaler = torch.amp.GradScaler("cuda", enabled=True)
 
     for epoch in range(start_epoch, args.epochs):
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+        
         model.train()
         epoch_loss = 0.0
         num_batches = 0
         optimizer.zero_grad()
 
-        pbar = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}")
+        if rank == 0:
+            pbar = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}")
+        else:
+            pbar = loader
+
         for batch_idx, (data, _labels) in enumerate(pbar):
             data = data.to(device, non_blocking=True)
 
@@ -157,15 +197,21 @@ def main():
                 with torch.no_grad():
                     data = vae.encode(data).latent_dist.sample() * vae_scaling_factor
 
-            # Forward with bf16 autocast
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                loss, _recon = model(data)
-                loss = loss / accum_steps
+            # Use no_sync for accumulation steps except the last one
+            # to avoid redundant gradient all-reduce
+            is_accum_step = ((batch_idx + 1) % accum_steps == 0) or ((batch_idx + 1) == len(loader))
+            
+            context = model.no_sync() if (world_size > 1 and not is_accum_step) else torch.nullcontext()
 
-            scaler.scale(loss).backward()
+            with context:
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    loss, _recon = model(data)
+                    loss = loss / accum_steps
+
+                scaler.scale(loss).backward()
 
             # Accumulation step
-            if (batch_idx + 1) % accum_steps == 0:
+            if is_accum_step:
                 # Update LR
                 lr = cosine_lr(global_step, total_steps, warmup_steps, args.lr)
                 for pg in optimizer.param_groups:
@@ -176,26 +222,30 @@ def main():
                 optimizer.zero_grad()
 
                 # EMA update
-                update_ema(ema_model, model, args.ema_decay)
+                # Unwrap DDP model for EMA source if needed
+                source_model = model.module if world_size > 1 else model
+                update_ema(ema_model, source_model, args.ema_decay)
 
                 global_step += 1
                 epoch_loss += loss.item() * accum_steps
                 num_batches += 1
 
-                if num_batches % 50 == 0:
+                if rank == 0 and num_batches % 50 == 0:
                     avg = epoch_loss / num_batches
                     pbar.set_postfix(loss=f"{avg:.4e}", lr=f"{lr:.2e}", step=global_step)
 
-        if num_batches > 0:
+        if rank == 0 and num_batches > 0:
             avg_loss = epoch_loss / num_batches
             print(f"Epoch {epoch}: avg_loss={avg_loss:.4e}")
 
-        # Save checkpoint
-        if (epoch + 1) % args.save_every == 0 or epoch == args.epochs - 1:
+        # Save checkpoint (Rank 0 only)
+        if rank == 0 and ((epoch + 1) % args.save_every == 0 or epoch == args.epochs - 1):
+            # Unwrap for saving
+            raw_model = model.module if world_size > 1 else model
             ckpt = {
                 "epoch": epoch,
                 "global_step": global_step,
-                "model": model.state_dict(),
+                "model": raw_model.state_dict(),
                 "ema_model": ema_model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "config": {
@@ -210,25 +260,26 @@ def main():
             torch.save(ckpt, path)
             print(f"Saved checkpoint to {path}")
 
-    # Save final
-    final_path = os.path.join(args.output_dir, "mae_final.pt")
-    ckpt = {
-        "epoch": args.epochs - 1,
-        "global_step": global_step,
-        "model": model.state_dict(),
-        "ema_model": ema_model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "config": {
-            "base_width": args.base_width,
-            "epochs": args.epochs,
-            "lr": args.lr,
-            "effective_batch": args.effective_batch,
-            "ema_decay": args.ema_decay,
-        },
-    }
-    torch.save(ckpt, final_path)
-    print(f"Training complete. Final checkpoint: {final_path}")
+    # Save final (Rank 0 only)
+    if rank == 0:
+        raw_model = model.module if world_size > 1 else model
+        final_path = os.path.join(args.output_dir, "mae_final.pt")
+        ckpt = {
+            "epoch": args.epochs - 1,
+            "global_step": global_step,
+            "model": raw_model.state_dict(),
+            "ema_model": ema_model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "config": {
+                "base_width": args.base_width,
+                "epochs": args.epochs,
+                "lr": args.lr,
+                "effective_batch": args.effective_batch,
+                "ema_decay": args.ema_decay,
+            },
+        }
+        torch.save(ckpt, final_path)
+        print(f"Training complete. Final checkpoint: {final_path}")
 
-
-if __name__ == "__main__":
-    main()
+    if dist.is_initialized():
+        dist.destroy_process_group()
