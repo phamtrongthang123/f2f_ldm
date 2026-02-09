@@ -10,45 +10,52 @@ Implements the paper's volume reconstruction pipeline (Algorithm 1, algo.tex):
    - Transpose back to B-planes for next step
 4. Save reconstructed volume
 
-Paper Algorithm 1 → ZEA API mapping:
-  ε_θ(x_τ, τ)           → DiffusionModel (Eq. 4, eq:dsm)
-  x_τ = α_τ x_0 + σ_τ ε → built-in forward diffusion (Eq. 2, eq:forward-diffusion)
-  x_{0|τ} Tweedie       → built-in reverse diffusion (Eq. 3, eq:tweedie)
-  y = Ax (measurement)   → inpainting operator (Eq. 5, eq:inverse-problem)
-  M = diag(A^T A) (mask) → elevation row mask (Eq. 7, eq:observation_zf)
-  DPS guidance (γ=35)    → manual gradient computation (Eq. 9-12, eq:dps-linear-*)
-  TV smoothness (ζ)      → per-step TV gradient (Algo 1 line 35-36)
-  SeqDiff warm-start     → forward-diffuse previous reconstruction (Algo 1 line 16-19)
+Paper Algorithm 1 → implementation mapping:
+  ε_θ(x_τ, τ)           → model.ema_network([x_τ, σ_τ²])      (Eq. 4, eq:dsm)
+  x_τ = α_τ x_0 + σ_τ ε → forward diffusion                    (Eq. 2, eq:forward-diffusion)
+  x_{0|τ} Tweedie       → (x_τ - σ_τ ε) / α_τ                  (Eq. 3, eq:tweedie)
+  y = Ax (measurement)   → inpainting: y = A x                   (Eq. 5, eq:inverse-problem)
+  A = elevation row mask  → binary mask operator                  (Eq. 7, eq:observation_zf)
+  DPS guidance (γ)       → jax.grad through ε_θ + Tweedie        (Eq. 9-12, eq:dps-linear-*)
+  TV smoothness (ζ)      → per-step TV gradient                  (Algo 1 line 35-36)
+  SeqDiff warm-start     → forward-diffuse previous recon         (Algo 1 line 16-19)
 
 Structure matches Algorithm 1 exactly:
-  Volume: (N_el, N_az, N_ax, C)
-  B-plane j: volume[:, j, :, :] = (N_el, N_ax, C)
+  Volume: X ∈ (N_el, N_az, N_ax, C)
+  B-plane j: X[:, j, :, :] = (N_el, N_ax, C)
 
   For τ = τ' to 1:                        # per-step (outer loop, line 25)
       For all B-planes j (batched):        # inner loop (line 26)
-          One diffusion step + DPS guidance # lines 27-32
+          ε = ε_θ(x_τ, τ)                 # line 27 — predict noise
+          x_{0|τ} = (x_τ - σ_τ ε) / α_τ   # line 28 — Tweedie
+          g = ∇_{x_τ} ||y - A x_{0|τ}||   # lines 29-30 — DPS gradient
+          x_{τ-1} = α_{τ-1} x_{0|τ} + σ_{τ-1} ε  # line 31 — DDIM
+          x_{τ-1} ← x_{τ-1} - g           # line 32 — DPS correction
+          x_{τ-1} ← A y + (1-A) x_{τ-1}   # projection — data consistency
       EndFor                               # line 33
       Stack B-planes into X_{τ-1}          # line 34
-      Apply TV_az to volume                # lines 35-36
+      V ← ∇_X TV_az(X_{τ-1})              # line 35
+      X_{τ-1} ← X_{τ-1} - α_{τ-1} ζ V    # line 36
   EndFor                                   # line 37
 """
 
-import env_setup  # noqa: F401 — must be first
-
 import os
-import numpy as np
+
+import env_setup  # noqa: F401 — must be first
+import jax
 import jax.numpy as jnp
+import numpy as np
 from zea import init_device
 from zea.models.diffusion import DiffusionModel
 
 # --- Config ---
-ACCEL_RATE = 4       # r ≥ 1, acceleration rate (Eq. 5, eq:inverse-problem)
-N_STEPS = 200        # T, diffusion steps (Algo 1 line 25)
-OMEGA = 35.0         # γ, guidance strength (Eq. 12, eq:dps-linear-4)
-ZETA = 0.001         # ζ, smoothness strength (Algo 1 line 36)
-BATCH_SIZE = 16      # Batch B-planes through model for memory
+ACCEL_RATE = 4  # r ≥ 1, acceleration rate (Eq. 5, eq:inverse-problem)
+N_STEPS = 200  # T, diffusion steps (Algo 1 line 25)
+GAMMA = 35.0  # γ, guidance strength (Eq. 12, eq:dps-linear-4)
+ZETA = 0.001  # ζ, smoothness strength (Algo 1 line 36)
+BATCH_SIZE = 16  # Batch B-planes through model for memory
 USE_SEQDIFF = False  # Enable SeqDiff warm-start from previous reconstruction
-SEQDIFF_TAU = 50     # τ', warm-start diffusion step (Algo 1 line 11, 19)
+SEQDIFF_TAU = 50  # τ', warm-start diffusion step (Algo 1 line 11, 19)
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
 
 # --- Init device ---
@@ -63,9 +70,9 @@ print(f"Model loaded. Input shape: {img_shape}")
 
 # --- Load pseudo-volume ---
 volume_path = os.path.join(OUTPUT_DIR, "pseudo_volume.npy")
-volume_gt = np.load(volume_path)
-N_el, N_az, N_ax, C = volume_gt.shape
-print(f"Loaded ground truth volume: {volume_gt.shape}")
+X_gt = np.load(volume_path)
+N_el, N_az, N_ax, C = X_gt.shape
+print(f"Loaded ground truth volume: {X_gt.shape}")
 print(f"  N_el={N_el}, N_az={N_az}, N_ax={N_ax}, C={C}")
 assert (N_el, N_ax, C) == (H, W, 1), (
     f"B-plane shape (N_el, N_ax, C) = ({N_el}, {N_ax}, {C}) "
@@ -73,95 +80,100 @@ assert (N_el, N_ax, C) == (H, W, 1), (
 )
 
 
-def compute_tv_gradient_azimuth(volume):
-    """Compute TV gradient along the azimuth dimension (axis 1).
+def compute_tv_gradient_azimuth(X):
+    """TV gradient along azimuth (axis 1). Algo 1 lines 35-36.
 
-    Implements lines 35-36 of Algorithm 1:
-      V ← ∇_{X_τ} TV_az(X_{τ-1})
-      X_{τ-1} ← X_{τ-1} - α_{τ-1} ζ V
-
-    Volume shape: (N_el, N_az, N_ax, C).
-    TV_az computes total variation along azimuth (axis 1).
+    V ← ∇_X TV_az(X)
 
     Args:
-        volume: Volume of shape (N_el, N_az, N_ax, C).
+        X: Volume of shape (N_el, N_az, N_ax, C).
 
     Returns:
-        TV gradient of same shape as volume.
+        V: TV gradient of same shape.
     """
-    diff = np.diff(volume, axis=1)  # (N_el, N_az-1, N_ax, C)
+    diff = np.diff(X, axis=1)  # (N_el, N_az-1, N_ax, C)
     eps = 1e-8
     norm = np.sqrt(diff**2 + eps)
     normalized = diff / norm
 
     # Divergence (adjoint of gradient)
-    div = np.zeros_like(volume)
+    div = np.zeros_like(X)
     div[:, :-1] += normalized
     div[:, 1:] -= normalized
 
     return -div  # Negative divergence as TV gradient
 
 
-def one_diffusion_step(model, noisy_images, measurements, mask, step, n_steps, omega):
-    """Perform one diffusion step with DPS guidance for a batch of B-planes.
+def one_diffusion_step(
+    model,
+    x_tau,
+    y,
+    A,
+    sigma_tau,
+    alpha_tau,
+    sigma_tau_minus_1,
+    alpha_tau_minus_1,
+    gamma,
+):
+    """One diffusion step with DPS guidance (Algo 1 lines 27-32).
 
     Args:
         model: DiffusionModel instance.
-        noisy_images: Current noisy images, shape (B, H, W, C).
-        measurements: Measurement data, shape (B, H, W, C).
-        mask: Measurement mask, shape (B, H, W, C) or (1, H, W, C).
-        step: Current diffusion step (0 to n_steps-1).
-        n_steps: Total number of diffusion steps.
-        omega: DPS guidance weight.
+        x_tau: Current noisy B-planes x_τ, shape (B, H, W, C).
+        y: Measurements y = Ax, shape (B, H, W, C).
+        A: Measurement operator (binary mask for inpainting), shape (1, H, W, C).
+        sigma_tau: Noise rate σ_τ, shape (1, 1, 1, 1).
+        alpha_tau: Signal rate α_τ, shape (1, 1, 1, 1).
+        sigma_tau_minus_1: Noise rate σ_{τ-1}, shape (1, 1, 1, 1).
+        alpha_tau_minus_1: Signal rate α_{τ-1}, shape (1, 1, 1, 1).
+        gamma: DPS guidance weight γ (scalar).
 
     Returns:
-        Updated noisy images after one diffusion step.
+        x_tau_minus_1: Updated B-planes x_{τ-1}, shape (B, H, W, C).
+        x_0_tau: Tweedie estimate x_{0|τ}, shape (B, H, W, C).
     """
-    num_images = noisy_images.shape[0]
-    n_dims = len(model.input_shape)
-    step_size = model.max_t / n_steps
+    x_tau = jnp.asarray(x_tau)
+    y = jnp.asarray(y)
+    A = jnp.asarray(A)
 
-    # Compute diffusion times for current step
-    base_diffusion_times = jnp.ones((num_images, *[1] * n_dims)) * model.max_t
-    diffusion_times = base_diffusion_times - step * step_size
-    noise_rates, signal_rates = model.diffusion_schedule(diffusion_times)
+    # Line 27: ε = ε_θ(x_τ, σ²_τ)
+    # Paper writes ε_θ(x_τ, τ), but ZEA conditions on σ²_τ (noise variance)
+    # instead of raw τ (diffusion time). They're equivalent since τ → σ_τ is
+    # deterministic via the cosine schedule, but σ²_τ is what the UNet's
+    # sinusoidal embedding actually receives.
+    def eps_theta(x):
+        # need this to ensure broadcast correctly
+        sigma_2 = jnp.full((BATCH_SIZE, 1, 1, 1), sigma_tau**2, dtype=x.dtype)
+        return model.ema_network([x, sigma_2], training=False)
 
-    # Compute next diffusion times
-    next_diffusion_times = diffusion_times - step_size
-    next_noise_rates, next_signal_rates = model.diffusion_schedule(next_diffusion_times)
+    epsilon, vjp_fn = jax.vjp(eps_theta, x_tau)
 
-    # Convert to tensors
-    noisy_images_t = jnp.asarray(noisy_images)
-    measurements_t = jnp.asarray(measurements)
-    mask_t = jnp.asarray(mask)
+    # Line 28: x_{0|τ} = (x_τ - σ_τ ε) / α_τ  (Tweedie, Eq. 3)
+    x_0_tau = (x_tau - sigma_tau * epsilon) / alpha_tau
 
-    # DPS guidance: compute gradients and predictions (Algo 1 lines 27-31)
-    gradients, (error, (pred_noises, pred_images)) = model.guidance_fn(
-        noisy_images_t,
-        measurements=measurements_t,
-        noise_rates=noise_rates,
-        signal_rates=signal_rates,
-        omega=omega,
-        mask=mask_t,
-    )
+    # Line 29: M ← y − A x_{0|τ}  (measurement error, Eq. 9)
+    M = y - A * x_0_tau
 
-    # Reverse diffusion step — DDIM (Algo 1 line 32)
-    next_noisy_images = model.reverse_diffusion_step(
-        shape=(num_images, *model.input_shape),
-        pred_images=pred_images,
-        pred_noises=pred_noises,
-        signal_rates=signal_rates,
-        next_signal_rates=next_signal_rates,
-        next_noise_rates=next_noise_rates,
-        seed=None,
-        stochastic_sampling=False,
-    )
+    # Line 29: P ← (I − σ_τ ∇_{x_τ} ε_θ(x_τ, τ))^T A^T   (Projection)
+    def P(v):
+        # A^T v
+        u = A * v
+        # (I − σ_τ ∇_{x_τ} ε_θ)^T u = u − σ_τ J^T u
+        return u - sigma_tau * vjp_fn(u)[0]
 
-    # Apply DPS guidance correction
-    next_noisy_images = next_noisy_images - gradients
-    pred_images = pred_images - gradients
+    # Line 30: M ← y − A x_{0|τ}  (measurement error, Eq. 9)
+    M = y - A * x_0_tau
 
-    return np.array(next_noisy_images), np.array(pred_images)
+    # Line 31: g = γ/α_τ · P · M  (DPS gradient, Eq. 10-12)
+    g = gamma / alpha_tau * P(M)
+
+    # Line 31: x_{τ-1} = α_{τ-1} x_{0|τ} + σ_{τ-1} ε  (DDIM reverse step)
+    x_tau_minus_1 = alpha_tau_minus_1 * x_0_tau + sigma_tau_minus_1 * epsilon
+
+    # Line 32: x_{τ-1} ← x_{τ-1} + g  (DPS correction)
+    x_tau_minus_1 = x_tau_minus_1 + g
+
+    return np.array(x_tau_minus_1), np.array(x_0_tau)
 
 
 # --- Elevation subsampling: observed rows in each B-plane ---
@@ -171,25 +183,36 @@ print(f"\nAcceleration rate: {ACCEL_RATE}x")
 print(f"Observed elevation rows ({len(observed_rows)}): {observed_rows[:8]}...")
 print(f"Missing elevation rows ({len(missing_rows)}): {missing_rows[:8]}...")
 
-# --- Create elevation row mask (same for ALL B-planes) ---
+# --- Measurement operator A (same for ALL B-planes) ---
 # Shape: (N_el, N_ax, C) = (H, W, 1) — matches model input
-# 1s at observed elevation rows, 0s elsewhere
-elevation_mask = np.zeros((N_el, N_ax, C), dtype=np.float32)
-elevation_mask[observed_rows] = 1.0
-print(f"Elevation mask shape: {elevation_mask.shape}, "
-      f"observed fraction: {elevation_mask.mean():.2f}")
+# Binary mask: 1s at observed elevation rows, 0s elsewhere
+A = np.zeros((N_el, N_ax, C), dtype=np.float32)
+A[observed_rows] = 1.0
+print(f"Operator A shape: {A.shape}, observed fraction: {A.mean():.2f}")
 
-# --- Extract B-planes and create measurements (Algo 1 input: Y = AX) ---
-# B-plane j = volume[:, j, :, :] → shape (N_el, N_ax, C)
+# --- Extract B-planes and create measurements y = A X_gt ---
+# B-plane j = X_gt[:, j, :, :] → shape (N_el, N_ax, C)
 # Transpose to (N_az, N_el, N_ax, C) for batch processing
-bplanes_gt = np.transpose(volume_gt, (1, 0, 2, 3))  # (N_az, N_el, N_ax, C)
-print(f"B-planes shape: {bplanes_gt.shape}")
+B_gt = np.transpose(X_gt, (1, 0, 2, 3))  # (N_az, N_el, N_ax, C)
+print(f"B-planes shape: {B_gt.shape}")
 
-# Measurements: observed elevation rows from GT, zeros elsewhere
-measurements_all = bplanes_gt * elevation_mask[np.newaxis]  # (N_az, N_el, N_ax, C)
+# Measurements: y = A X_gt (observed elevation rows from GT, zeros elsewhere)
+y_all = B_gt * A[np.newaxis]  # (N_az, N_el, N_ax, C)
 
-# Broadcast mask to batch: (1, N_el, N_ax, C)
-mask_batch = elevation_mask[np.newaxis]  # (1, H, W, C) — broadcasts over batch
+# Broadcast operator to batch: (1, N_el, N_ax, C)
+A_batch = A[np.newaxis]  # (1, H, W, C) — broadcasts over batch
+
+# --- Precompute diffusion schedule: α_τ and σ_τ for each step ---
+alphas = []  # α_τ (signal rates)
+sigmas = []  # σ_τ (noise rates)
+step_size = model.max_t / N_STEPS
+for step in range(N_STEPS + 1):
+    diffusion_times = np.ones((1, 1, 1, 1)) * model.max_t - step * step_size
+    sigma, alpha = model.diffusion_schedule(diffusion_times)
+    alphas.append(float(np.array(alpha)[0, 0, 0, 0]))
+    sigmas.append(float(np.array(sigma)[0, 0, 0, 0]))
+alphas = np.array(alphas)
+sigmas = np.array(sigmas)
 
 # --- SeqDiff initialization (Algo 1 lines 16-23) ---
 prev_recon_path = os.path.join(OUTPUT_DIR, "reconstructed_volume.npy")
@@ -197,97 +220,94 @@ prev_recon_path = os.path.join(OUTPUT_DIR, "reconstructed_volume.npy")
 if USE_SEQDIFF and os.path.exists(prev_recon_path):
     # SeqDiff warm-start (Algo 1 lines 17-19)
     print(f"\nSeqDiff: loading previous reconstruction from {prev_recon_path}")
-    prev_recon = np.load(prev_recon_path)
-    print(f"Previous reconstruction shape: {prev_recon.shape}")
+    X_prev = np.load(prev_recon_path)
+    print(f"Previous reconstruction shape: {X_prev.shape}")
 
-    # X_0 ← X^prev, extract B-planes (Algo 1 line 17)
-    prev_bplanes = np.transpose(prev_recon, (1, 0, 2, 3))  # (N_az, N_el, N_ax, C)
+    # x_0 ← X^prev, extract B-planes (Algo 1 line 17)
+    x_0 = np.transpose(X_prev, (1, 0, 2, 3))  # (N_az, N_el, N_ax, C)
 
-    # Forward diffuse to τ': X_τ' ← α_τ' X_0 + σ_τ' ε (Algo 1 line 19)
+    # Forward diffuse to τ': x_τ' ← α_τ' x_0 + σ_τ' ε  (Algo 1 line 19)
     start_step = N_STEPS - SEQDIFF_TAU
-    step_size = model.max_t / N_STEPS
-    n_dims = len(model.input_shape)
-    diffusion_times = np.ones((1, *[1] * n_dims)) * model.max_t - start_step * step_size
-    noise_rates, signal_rates = model.diffusion_schedule(diffusion_times)
-    noise_rates = np.array(noise_rates)
-    signal_rates = np.array(signal_rates)
+    alpha_tau_prime = alphas[start_step]
+    sigma_tau_prime = sigmas[start_step]
 
-    noise = np.random.randn(*prev_bplanes.shape).astype(np.float32)
-    noisy_bplanes = signal_rates * prev_bplanes + noise_rates * noise
+    epsilon = np.random.randn(*x_0.shape).astype(np.float32)
+    x_tau = alpha_tau_prime * x_0 + sigma_tau_prime * epsilon
 
-    print(f"SeqDiff: forward-diffused to step {start_step}, "
-          f"running {SEQDIFF_TAU} steps (τ'={SEQDIFF_TAU})")
+    print(
+        f"SeqDiff: forward-diffused to step {start_step}, "
+        f"running {SEQDIFF_TAU} steps (τ'={SEQDIFF_TAU})"
+    )
 else:
-    # Cold start (Algo 1 lines 21-22)
+    # Cold start (Algo 1 lines 21-22): x_T ~ N(0, I)
     start_step = 0
-    noisy_bplanes = np.random.randn(N_az, N_el, N_ax, C).astype(np.float32)
+    x_tau = np.random.randn(N_az, N_el, N_ax, C).astype(np.float32)
     if USE_SEQDIFF:
         print("\nSeqDiff enabled but no previous reconstruction found. Cold start.")
     print("Initializing all B-planes with noise (cold start)")
 
-# --- Compute alpha schedule for TV regularization ---
-# Need N_STEPS+1 entries: alphas[step] = α_τ, alphas[step+1] = α_{τ-1}
-alphas = []
-for step in range(N_STEPS + 1):
-    diffusion_times = np.ones((1, 1, 1, 1)) * model.max_t - step * (model.max_t / N_STEPS)
-    _, signal_rates = model.diffusion_schedule(diffusion_times)
-    alphas.append(float(np.array(signal_rates)[0, 0, 0, 0]))
-alphas = np.array(alphas)
-
 # --- Main reconstruction loop (Algorithm 1 lines 25-37) ---
-print(f"\nReconstructing volume: {N_az} B-planes over {N_STEPS} diffusion steps "
-      f"(starting at step {start_step})...")
+print(
+    f"\nReconstructing volume: {N_az} B-planes over {N_STEPS} diffusion steps "
+    f"(starting at step {start_step})..."
+)
 print(f"B-plane shape: ({N_el}, {N_ax}, {C}), batch size: {BATCH_SIZE}")
 print("Structure: for τ → for all B-planes (batched) → DPS → stack → TV_az\n")
 
 for step in range(start_step, N_STEPS):
+    # Diffusion rates for this step
+    sigma_tau = jnp.full((1, 1, 1, 1), sigmas[step])
+    alpha_tau = jnp.full((1, 1, 1, 1), alphas[step])
+    sigma_tau_minus_1 = jnp.full((1, 1, 1, 1), sigmas[step + 1])
+    alpha_tau_minus_1 = jnp.full((1, 1, 1, 1), alphas[step + 1])
+
     # --- Process ALL B-planes for one diffusion step (Algo 1 lines 26-33) ---
-    updated_bplanes = np.empty_like(noisy_bplanes)
+    x_tau_minus_1 = np.empty_like(x_tau)
 
     for batch_start in range(0, N_az, BATCH_SIZE):
         batch_end = min(batch_start + BATCH_SIZE, N_az)
-        batch_noisy = noisy_bplanes[batch_start:batch_end]
-        batch_meas = measurements_all[batch_start:batch_end]
 
-        batch_updated, _ = one_diffusion_step(
+        x_tau_minus_1[batch_start:batch_end], _ = one_diffusion_step(
             model,
-            batch_noisy,
-            batch_meas,
-            mask_batch,
-            step,
-            N_STEPS,
-            OMEGA,
+            x_tau[batch_start:batch_end],
+            y_all[batch_start:batch_end],
+            A_batch,
+            sigma_tau,
+            alpha_tau,
+            sigma_tau_minus_1,
+            alpha_tau_minus_1,
+            GAMMA,
         )
 
-        updated_bplanes[batch_start:batch_end] = batch_updated
-
-    # --- Stack B-planes into volume (Algo 1 line 34) ---
+    # --- Stack B-planes into volume X_{τ-1} (Algo 1 line 34) ---
     # Transpose from (N_az, N_el, N_ax, C) → (N_el, N_az, N_ax, C)
-    volume_noisy = np.transpose(updated_bplanes, (1, 0, 2, 3))
+    X_tau_minus_1 = np.transpose(x_tau_minus_1, (1, 0, 2, 3))
 
-    # --- Apply TV regularization to volume (Algo 1 lines 35-36) ---
-    # V ← ∇_{X_τ} TV_az(X_{τ-1})
+    # --- TV regularization (Algo 1 lines 35-36) ---
+    # V ← ∇_X TV_az(X_{τ-1})
     # X_{τ-1} ← X_{τ-1} - α_{τ-1} ζ V
-    tv_grad = compute_tv_gradient_azimuth(volume_noisy)
-    alpha_step = alphas[step + 1]  # α_{τ-1}: signal rate at next (lower noise) timestep
-    volume_noisy = volume_noisy - alpha_step * ZETA * tv_grad
+    # V = compute_tv_gradient_azimuth(X_tau_minus_1)
+    # X_tau_minus_1 = X_tau_minus_1 - alpha_tau_minus_1 * ZETA * V
 
-    # --- Transpose back to B-planes for next step ---
-    noisy_bplanes = np.transpose(volume_noisy, (1, 0, 2, 3))
+    # --- Back to B-planes for next step ---
+    x_tau = np.transpose(X_tau_minus_1, (1, 0, 2, 3))
 
     # Progress logging
     if (step + 1) % 20 == 0 or step == start_step:
-        tv_val = np.sum(np.abs(np.diff(volume_noisy, axis=1)))
-        print(f"Step {step+1}/{N_STEPS}: TV={tv_val:.4f}, alpha={alpha_step:.4f}")
+        tv_val = np.sum(np.abs(np.diff(X_tau_minus_1, axis=1)))
+        print(
+            f"Step {step + 1}/{N_STEPS}: TV={tv_val:.4f}, "
+            f"α={alpha_tau_minus_1.reshape(()).item():.4f}"
+        )
 
-# Final output: TV-regularized volume from the last iteration (Algo 1 line 38)
-reconstructed = np.transpose(noisy_bplanes, (1, 0, 2, 3))
+# Final output: reconstructed volume (Algo 1 line 38)
+X_reconstructed = np.transpose(x_tau, (1, 0, 2, 3))
 
 print("\nReconstruction complete.")
 
 # --- Save ---
 save_path = os.path.join(OUTPUT_DIR, "reconstructed_volume.npy")
-np.save(save_path, reconstructed)
+np.save(save_path, X_reconstructed)
 print(f"\nSaved reconstructed volume to {save_path}")
-print(f"Reconstructed volume shape: {reconstructed.shape}")
+print(f"Reconstructed volume shape: {X_reconstructed.shape}")
 print("Volume reconstruction complete.")

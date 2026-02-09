@@ -9,7 +9,7 @@
 #SBATCH --partition=qgpu72
 #SBATCH --constraint=4a100
 
-set -euo pipefail
+# set -euo pipefail
 
 echo "Job started at: $(date)"
 echo "Running on node: $(hostname)"
@@ -39,16 +39,15 @@ apptainer exec --nv --writable-tmpfs \
     "${CONTAINER}" bash -c "
 source /share/apps/python/anaconda-3.14/etc/profile.d/conda.sh
 conda activate '${CONDA_ENV_NAME}'
-
+export PYTHONUNBUFFERED=1
+export TORCH_DISTRIBUTED_DEBUG=INFO
 cd ${PROJECT_ROOT}
+echo \"Current Python: \$(which python)\"
+echo \"Current Torchrun: \$(which torchrun)\"
+python -c \"import torch; print(f'Torch available: {torch.cuda.is_available()}')\" || echo \"PYTHON IMPORT FAILED\"
 
 echo '=== Training Latent-MAE (Multi-GPU DDP) ==='
-torchrun \
-    --nnodes=1 \
-    --nproc_per_node=4 \
-    --rdzv_id=${SLURM_JOB_ID} \
-    --rdzv_backend=c10d \
-    --rdzv_endpoint=localhost:29500 \
+torchrun --standalone --nnodes=1 --nproc_per_node=4 \
     train_mae.py \
     --latent_dir '$LATENT_DIR' \
     --output_dir '$OUTPUT_DIR' \

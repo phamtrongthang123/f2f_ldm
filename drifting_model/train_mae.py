@@ -17,6 +17,7 @@ Usage:
     python train_mae.py --imagenet_dir /path/to/imagenet \
         --output_dir ./checkpoints/mae --base_width 256
 """
+from sklearn.externals.array_api_compat.torch import __name
 
 import os
 import copy
@@ -69,7 +70,7 @@ def main():
     parser.add_argument("--save_every", type=int, default=10,
                         help="Save checkpoint every N epochs")
     args = parser.parse_args()
-
+    print("Run or nah?")
     # --- DDP Setup ---
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         dist.init_process_group("nccl")
@@ -283,3 +284,7 @@ def main():
 
     if dist.is_initialized():
         dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()

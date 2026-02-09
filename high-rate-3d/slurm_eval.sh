@@ -6,7 +6,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=64
-#SBATCH --partition=agpu72
+#SBATCH --partition=agpu06
 #SBATCH --constraint=1a100
 
 echo "Job started at: $(date)"

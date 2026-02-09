@@ -17,15 +17,15 @@ python -c "import jax; print(f'JAX: {jax.__version__}')"
 python -c "import jax; print(f'Devices: {jax.devices()}')"
 python -c "import keras; print(f'Keras: {keras.__version__}, backend: {keras.backend.backend()}')"
 
-# Step 1: Verify prior
-echo ""
-echo "=== Step 1: Verify prior ==="
-python 01_verify_prior.py
+# # Step 1: Verify prior
+# echo ""
+# echo "=== Step 1: Verify prior ==="
+# python 01_verify_prior.py
 
-# Step 2: Prepare pseudo-volume
-echo ""
-echo "=== Step 2: Prepare pseudo-volume ==="
-python 02_prepare_pseudo_volume.py
+# # Step 2: Prepare pseudo-volume
+# echo ""
+# echo "=== Step 2: Prepare pseudo-volume ==="
+# python 02_prepare_pseudo_volume.py
 
 # Step 3: Reconstruct volume (main algorithm)
 echo ""

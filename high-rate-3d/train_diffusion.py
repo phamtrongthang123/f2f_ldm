@@ -212,6 +212,12 @@ def main():
     img_shape = model.input_shape[:2]  # (112, 112)
     print(f"Model input shape: {model.input_shape}")
 
+    # Build the Keras model (needed for save_weights later)
+    dummy_img = jnp.zeros((1, *model.input_shape))
+    dummy_var = jnp.zeros((1, 1, 1, 1))
+    _ = model([dummy_img, dummy_var], training=False)
+    print("  Model built.")
+
     # ---- Data (memory-mapped, instant) ----
     print(f"Loading data from {args.data_dir} ...")
     train_data = load_data(os.path.join(args.data_dir, "train_frames.npy"))

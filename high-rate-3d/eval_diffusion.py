@@ -29,6 +29,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy import linalg
 from zea import init_device
+from zea.data.convert.echonet import segment, cartesian_to_polar_matrix
+from zea.func.tensor import translate
 from zea.models.diffusion import DiffusionModel
 from zea.visualize import plot_image_grid
 
@@ -46,6 +48,10 @@ def parse_args():
                     help="Number of real images for FID")
     p.add_argument("--n-steps", type=int, default=200,
                     help="Diffusion steps for sampling")
+    p.add_argument("--dynamic-range", type=float, default=40,
+                    help="dB dynamic range for ZEA-style preprocessing (0 = linear uint8)")
+    p.add_argument("--zea-preprocess", action="store_true",
+                    help="Apply full ZEA pipeline (segment + polar convert) to real images")
     p.add_argument("--output-dir", default="outputs/eval")
     return p.parse_args()
 
@@ -110,9 +116,52 @@ def compute_fid(real_features, gen_features):
 # Data
 # ---------------------------------------------------------------------------
 
-def get_batch(data, indices):
-    """Read a batch from mmap, convert to float32 [-1, 1] with channel dim."""
-    batch = data[indices].astype(np.float32) / 127.5 - 1.0
+def get_batch(data, indices, dynamic_range=40):
+    """Read a batch from mmap, apply dB normalization, return (B, H, W, 1).
+
+    ZEA pipeline: [0,255] → [-60,0] "dB" → clip [-DR,0] → [-1,1]
+    If dynamic_range=0, falls back to simple linear [0,255] → [-1,1].
+    """
+    batch = data[indices].astype(np.float32)
+    if dynamic_range > 0:
+        batch = batch * (60.0 / 255.0) - 60.0
+        np.clip(batch, -dynamic_range, 0, out=batch)
+        batch = batch * (2.0 / dynamic_range) + 1.0
+    else:
+        batch = batch / 127.5 - 1.0
+    return batch[..., np.newaxis]
+
+
+def zea_preprocess_frame(frame_uint8, dynamic_range=40):
+    """Apply full ZEA pipeline to a single frame: segment + polar + dB normalize.
+
+    Input: (112, 112) uint8
+    Output: (112, 112) float32 in [-1, 1]
+    """
+    # [0, 255] → [0, 1]
+    frame = frame_uint8.astype(np.float32) / 255.0
+    # Segment background
+    frame_3d = frame[np.newaxis]  # segment expects (N, H, W)
+    frame_3d = segment(frame_3d, number_erasing=0, min_clip=0)
+    frame = frame_3d[0]
+    # Cartesian → polar
+    polar = cartesian_to_polar_matrix(frame, interpolation="cubic")
+    polar = np.clip(polar, 0, 1)
+    # [0, 1] → [-60, 0]
+    polar_db = translate(polar, (0, 1), (-60, 0))
+    # Clip to [-DR, 0] → [-1, 1]
+    polar_db = np.clip(polar_db, -dynamic_range, 0)
+    normalized = translate(polar_db, (-dynamic_range, 0), (-1, 1))
+    return normalized
+
+
+def get_batch_zea(data, indices, dynamic_range=40):
+    """Load and apply full ZEA preprocessing (segment + polar) per frame."""
+    frames = []
+    for idx in indices:
+        frame = zea_preprocess_frame(data[idx], dynamic_range)
+        frames.append(frame)
+    batch = np.stack(frames, axis=0)
     return batch[..., np.newaxis]
 
 
@@ -172,19 +221,28 @@ def main():
 
     # ---- Prepare real images for FID ----
     n_real = min(args.n_real, n_val)
+    preprocess_label = "ZEA (segment+polar+dB)" if args.zea_preprocess else f"DR={args.dynamic_range}"
     print(f"\nPreparing {n_real} real images for FID ...")
+    print(f"  Preprocessing: {preprocess_label}")
     rng = np.random.default_rng(42)
     real_idx = rng.choice(n_val, size=n_real, replace=False)
     real_idx.sort()  # sequential access is faster on mmap
 
     # Load real images in chunks
-    chunk_size = 1000
+    chunk_size = 100 if args.zea_preprocess else 1000
     real_images = []
+    t0 = time.time()
     for i in range(0, n_real, chunk_size):
         idx = real_idx[i:i + chunk_size]
-        real_images.append(get_batch(val_data, idx))
-        print(f"  Loaded {min(i + chunk_size, n_real)}/{n_real} real images", flush=True)
+        if args.zea_preprocess:
+            real_images.append(get_batch_zea(val_data, idx, args.dynamic_range))
+        else:
+            real_images.append(get_batch(val_data, idx, args.dynamic_range))
+        if (i // chunk_size + 1) % 10 == 0 or i == 0:
+            print(f"  Loaded {min(i + chunk_size, n_real)}/{n_real} real images "
+                  f"({time.time() - t0:.0f}s)", flush=True)
     real_images = np.concatenate(real_images, axis=0)  # (n_real, 112, 112, 1)
+    print(f"  Done loading real images in {time.time() - t0:.0f}s")
 
     # ---- Extract features ----
     inception = build_feature_extractor()
@@ -204,6 +262,7 @@ def main():
 
     print(f"\n{'='*60}")
     print(f"Model: {args.model}")
+    print(f"Preprocessing: {preprocess_label}")
     print(f"FID: {fid:.2f}")
     print(f"  (real: {n_real}, generated: {n_samples}, steps: {args.n_steps})")
     print(f"{'='*60}")
@@ -212,6 +271,8 @@ def main():
     results = {
         "model": args.model,
         "fid": fid,
+        "dynamic_range": args.dynamic_range,
+        "zea_preprocess": args.zea_preprocess,
         "n_real": n_real,
         "n_generated": n_samples,
         "n_steps": args.n_steps,
