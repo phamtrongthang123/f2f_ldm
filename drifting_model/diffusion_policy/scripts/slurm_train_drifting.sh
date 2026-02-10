@@ -4,9 +4,9 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=64
-#SBATCH --time=06:00:00
+#SBATCH --time=2-00:00:00
 #SBATCH --output=slurm_logs/train_drifting_%j.out
-#SBATCH --partition=agpu06
+#SBATCH --partition=agpu
 #SBATCH --constraint=1a100
 
 set -euo pipefail
