@@ -4,9 +4,9 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=64
-#SBATCH --time=24:00:00
+#SBATCH --time=06:00:00
 #SBATCH --output=slurm_logs/train_%j.out
-#SBATCH --partition=agpu72
+#SBATCH --partition=agpu06
 #SBATCH --constraint=1a100
 
 set -euo pipefail
@@ -31,14 +31,11 @@ apptainer exec --nv --writable-tmpfs \
 source /share/apps/python/anaconda-3.14/etc/profile.d/conda.sh
 cd ${PROJECT_ROOT}
 
-# Try to activate the environment, install if it fails
-if ! conda activate '${CONDA_ENV_NAME}' 2>/dev/null; then
-    echo \"Environment '${CONDA_ENV_NAME}' not found. Installing from conda_environment.yaml...\"
-    conda env create -f conda_environment.yaml
-    conda activate '${CONDA_ENV_NAME}'
-fi
+# conda env update -f conda_environment.yaml --prune
 
+conda activate \"${CONDA_ENV_NAME}\"
 
+# pip install robomimic==0.2.0
 echo '=== Launching Diffusion Policy Training ==='
 python train.py \
     --config-dir=. \
