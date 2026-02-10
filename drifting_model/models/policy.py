@@ -1,156 +1,120 @@
-import math
+import sys
+import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# Ensure diffusion_policy is in the path for imports
+# This matches the pattern used in the training/eval scripts
+diffusion_policy_path = os.path.join(os.getcwd(), 'diffusion_policy')
+if diffusion_policy_path not in sys.path:
+    sys.path.append(diffusion_policy_path)
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
-        self.eps = eps
-
-    def forward(self, x):
-        rms = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
-        return (x.float() * rms).to(x.dtype) * self.weight
-
-class SwiGLUFFN(nn.Module):
-    def __init__(self, dim, hidden_dim=None):
-        super().__init__()
-        hidden_dim = hidden_dim or int(dim * 8 / 3)
-        hidden_dim = ((hidden_dim + 255) // 256) * 256
-        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
-        self.w2 = nn.Linear(dim, hidden_dim, bias=False)
-        self.w3 = nn.Linear(hidden_dim, dim, bias=False)
-
-    def forward(self, x):
-        return self.w3(F.silu(self.w1(x)) * self.w2(x))
-
-class Attention(nn.Module):
-    def __init__(self, dim, num_heads):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
-        self.out_proj = nn.Linear(dim, dim, bias=False)
-        self.q_norm = RMSNorm(self.head_dim)
-        self.k_norm = RMSNorm(self.head_dim)
-
-    def forward(self, x):
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.unbind(2)
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-        
-        # Standard attention (no RoPE for now, rely on PE)
-        x = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
-        x = x.transpose(1, 2).reshape(B, N, C)
-        return self.out_proj(x)
-
-class DiTBlock(nn.Module):
-    def __init__(self, dim, num_heads):
-        super().__init__()
-        self.norm1 = RMSNorm(dim)
-        self.attn = Attention(dim, num_heads)
-        self.norm2 = RMSNorm(dim)
-        self.ffn = SwiGLUFFN(dim)
-
-        # adaLN-zero
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(dim, 6 * dim),
-        )
-        nn.init.zeros_(self.adaLN_modulation[1].weight[-2 * dim:])
-        nn.init.zeros_(self.adaLN_modulation[1].bias[-2 * dim:])
-
-    def forward(self, x, cond):
-        mod = self.adaLN_modulation(cond)
-        gamma1, beta1, alpha1, gamma2, beta2, alpha2 = mod.chunk(6, dim=-1)
-
-        h = self.norm1(x)
-        h = h * (1 + gamma1.unsqueeze(1)) + beta1.unsqueeze(1)
-        h = self.attn(h)
-        x = x + alpha1.unsqueeze(1) * h
-
-        h = self.norm2(x)
-        h = h * (1 + gamma2.unsqueeze(1)) + beta2.unsqueeze(1)
-        h = self.ffn(h)
-        x = x + alpha2.unsqueeze(1) * h
-
-        return x
+try:
+    from diffusion_policy.model.diffusion.conditional_unet1d import ConditionalUnet1D
+except ImportError as e:
+    # Fallback for different directory structures if needed
+    try:
+        from model.diffusion.conditional_unet1d import ConditionalUnet1D
+    except ImportError:
+        raise ImportError(f"Could not import ConditionalUnet1D from diffusion_policy: {e}")
 
 class DriftingPolicy(nn.Module):
-    """1D DiT-based generator for robotics control."""
+    """CNN-based generator for robotics control via Drifting.
+    
+    Wraps the reference ConditionalUnet1D from the diffusion_policy repository
+    to implement the Drifting Model training and inference logic.
+    """
     
     def __init__(
         self,
         action_dim,
         obs_dim,
         horizon=16,
-        embed_dim=256,
-        depth=6,
-        num_heads=8,
+        down_dims=[256, 512, 1024],
+        diffusion_step_embed_dim=256,
+        kernel_size=5,
+        n_groups=8,
+        cond_predict_scale=True
     ):
         super().__init__()
         self.action_dim = action_dim
         self.obs_dim = obs_dim
         self.horizon = horizon
-        self.embed_dim = embed_dim
+        self.normalizer = None
         
-        # Action embedding
-        self.input_proj = nn.Linear(action_dim, embed_dim)
-        
-        # Positional embedding
-        self.pos_embed = nn.Parameter(torch.randn(1, horizon, embed_dim) * 0.02)
-        
-        # Observation conditioning projection
-        self.obs_proj = nn.Linear(obs_dim, embed_dim)
-        
-        # Transformer blocks
-        self.blocks = nn.ModuleList([
-            DiTBlock(embed_dim, num_heads) for _ in range(depth)
-        ])
-        
-        # Output
-        self.final_norm = RMSNorm(embed_dim)
-        self.final_adaLN = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(embed_dim, 2 * embed_dim),
+        # Use the reference implementation directly
+        self.unet = ConditionalUnet1D(
+            input_dim=action_dim,
+            global_cond_dim=obs_dim,
+            diffusion_step_embed_dim=diffusion_step_embed_dim,
+            down_dims=down_dims,
+            kernel_size=kernel_size,
+            n_groups=n_groups,
+            cond_predict_scale=cond_predict_scale
         )
-        self.output_proj = nn.Linear(embed_dim, action_dim)
         
-        self.initialize_weights()
-        
-    def initialize_weights(self):
-        nn.init.xavier_uniform_(self.input_proj.weight)
-        nn.init.zeros_(self.output_proj.weight)
-        nn.init.zeros_(self.output_proj.bias)
-        
-    def forward(self, noise, obs):
+    def set_normalizer(self, normalizer):
+        self.normalizer = normalizer
+
+    def forward(self, noise, obs, timestep=None):
         """
         Args:
             noise: [B, T, action_dim] Gaussian noise
-            obs: [B, obs_dim] Observation vector
+            obs: [B, obs_dim] Observation vector (already flattened history)
+            timestep: [B] or scalar. Defaults to 0 for one-step drifting.
             
         Returns:
-            action: [B, T, action_dim]
+            action: [B, T, action_dim] (UNNORMALIZED if normalizer is set)
         """
-        x = self.input_proj(noise) + self.pos_embed
-        
-        cond = self.obs_proj(obs) # [B, embed_dim]
-        
-        for block in self.blocks:
-            x = block(x, cond)
+        if timestep is None:
+            timestep = torch.zeros((noise.shape[0],), device=noise.device, dtype=torch.long)
             
-        mod = self.final_adaLN(cond)
-        gamma, beta = mod.chunk(2, dim=-1)
+        # The reference Unet expects (B, T, D) and returns (B, T, D)
+        # after internal rearrangements.
+        x = self.unet(noise, timestep, global_cond=obs)
         
-        x = self.final_norm(x)
-        x = x * (1 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
-        x = self.output_proj(x)
-        
+        if self.normalizer is not None:
+            x = self.normalizer['action'].unnormalize(x)
+            
         return x
+
+    def compute_loss(self, obs, action_gt, temperatures=[0.02, 0.05, 0.2]):
+        """
+        Implements Drifting Model training objective.
+        
+        Args:
+            obs: [B, obs_dim]
+            action_gt: [B, T, action_dim] real data samples (y+) (UNNORMALIZED)
+        """
+        from drifting_loss import compute_drifting_loss
+        
+        if self.normalizer is not None:
+            action_gt = self.normalizer['action'].normalize(action_gt)
+        
+        B, T, Da = action_gt.shape
+        
+        # Sample noise (epsilon)
+        noise = torch.randn_like(action_gt)
+        
+        # Generate samples (x) - we need NORMALIZED x for loss
+        timestep = torch.zeros((B,), device=noise.device, dtype=torch.long)
+        x_gen = self.unet(noise, timestep, global_cond=obs)
+        
+        # Reshape for compute_drifting_loss: [B, 1, D] where D = T*Da
+        gen_latent = x_gen.reshape(B, -1)
+        pos_latent = action_gt.reshape(B, -1)
+        
+        # Drift computation
+        loss = compute_drifting_loss(
+            gen_features=[],
+            pos_features=[],
+            neg_features=[],
+            uncond_features=[],
+            temperatures=temperatures,
+            cfg_weights=None,
+            gen_latent=gen_latent,
+            pos_latent=pos_latent,
+            neg_latent=gen_latent, # x is its own negative
+        )
+        
+        return loss

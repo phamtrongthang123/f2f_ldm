@@ -67,12 +67,6 @@ def get_dataset(args):
         raise ValueError(f"Unknown task: {args.task}")
 
 def main():
-    print(f"Torch version: {torch.__version__}")
-    print(f"CUDA available: {torch.cuda.is_available()}")
-    print(f"CUDA device count: {torch.cuda.device_count()}")
-    if torch.cuda.is_available():
-        print(f"CUDA device name: {torch.cuda.get_device_name(0)}")
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", type=str, default="pusht", choices=["pusht", "lift", "can", "square", "kitchen"])
     parser.add_argument("--data_dir", type=str, default="data/pusht_cchi_v7_replay.zarr")
@@ -110,7 +104,7 @@ def main():
     print(f"Obs dim: {obs_dim}, Action dim: {action_dim}")
 
     # Normalizer
-    normalizer = dataset.get_normalizer()
+    normalizer = dataset.get_normalizer().to(args.device)
     
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=8, pin_memory=True)
     
@@ -122,16 +116,13 @@ def main():
         action_dim=action_dim,
         obs_dim=cond_dim, 
         horizon=args.horizon,
-        embed_dim=256,
-        depth=6,
-        num_heads=8
+        down_dims=[256, 512, 1024],
+        kernel_size=5,
     ).to(args.device)
+    policy.set_normalizer(normalizer)
     
     optimizer = optim.AdamW(policy.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    
-    # Drifting Loss Params
-    temperatures = [0.02, 0.05, 0.2]
     
     # 3. Training Loop
     print(f"Starting training on {args.device}...")
@@ -143,34 +134,18 @@ def main():
         
         for batch in pbar:
             nobs = batch['obs'].to(args.device)
-            naction = batch['action'].to(args.device)
+            action = batch['action'].to(args.device)
             
-            # Normalize
+            # Normalize observation (internal to training loop)
             nobs = normalizer['obs'].normalize(nobs)
-            naction = normalizer['action'].normalize(naction)
             
             B = nobs.shape[0]
             
             # Flatten obs for condition: take first n_obs_steps
             cond = nobs[:, :args.n_obs_steps, :].reshape(B, -1)
             
-            # Target action (flattened)
-            y_pos = naction.reshape(B, -1)
-            
-            # Generate
-            noise = torch.randn(B, args.horizon, action_dim, device=args.device)
-            gen_action = policy(noise, cond)
-            x = gen_action.reshape(B, -1)
-            
-            loss = compute_drifting_loss(
-                gen_features=[], pos_features=[], neg_features=[], uncond_features=[],
-                temperatures=temperatures,
-                cfg_weights=None,
-                gen_latent=x,
-                pos_latent=y_pos,
-                neg_latent=x,
-                uncond_latent=None
-            )
+            # Drifting Loss (handles action normalization internally)
+            loss = policy.compute_loss(cond, action)
             
             optimizer.zero_grad()
             loss.backward()

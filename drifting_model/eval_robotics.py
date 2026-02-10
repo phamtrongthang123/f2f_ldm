@@ -32,6 +32,7 @@ def main():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--n_episodes", type=int, default=50)
     parser.add_argument("--horizon", type=int, default=16)
+    parser.add_argument("--n_obs_steps", type=int, default=2)
     parser.add_argument("--exec_steps", type=int, default=8, help="Receding horizon execution steps")
     parser.add_argument("--render", action="store_true")
     args = parser.parse_args()
@@ -47,35 +48,28 @@ def main():
     action_dim = 2
     policy = DriftingPolicy(
         action_dim=action_dim,
-        obs_dim=obs_dim * args.horizon, # Flattened history
-        # Note: In training we flattened [B, T, Do]. 
-        # Here we need to match that.
-        # If training used T=16 obs history, we need to maintain history.
+        obs_dim=obs_dim * args.n_obs_steps, # Flattened history
         horizon=args.horizon,
-        embed_dim=256,
-        depth=6,
-        num_heads=8
+        down_dims=[256, 512, 1024],
+        kernel_size=5,
     ).to(args.device)
     
     policy.load_state_dict(ckpt['model'])
-    policy.eval()
     
     # Load Normalizer
     normalizer = LinearNormalizer()
     normalizer.load_state_dict(ckpt['normalizer'])
+    policy.set_normalizer(normalizer)
+    
+    policy.eval()
     
     total_rewards = []
     success_count = 0
     
     for i in tqdm(range(args.n_episodes)):
         obs = env.reset()
-        # Create obs history buffer
-        # In training, we used SequenceSampler which gives T steps of obs.
-        # Here we need to stack current obs T times or wait for history?
-        # Standard DP approach: pad with first obs.
-        
         # We need a queue of observations
-        obs_deque = collections.deque([get_obs_vector(obs, env._get_info()['pos_agent'])] * args.horizon, maxlen=args.horizon)
+        obs_deque = collections.deque([get_obs_vector(obs, env._get_info()['pos_agent'])] * args.n_obs_steps, maxlen=args.n_obs_steps)
         
         done = False
         step_count = 0
@@ -83,31 +77,26 @@ def main():
         
         while not done:
             # 1. Prepare Observation
-            # Stack deque -> [T, Do]
-            obs_seq = np.stack(obs_deque) # [T, 20]
-            # Normalize
+            # Stack deque -> [n_obs_steps, Do]
+            obs_seq = np.stack(obs_deque) # [2, 20]
+            # Normalize observation (internal to evaluation loop)
             nobs = normalizer.normalize(obs_seq, key='obs')
             
             # Batchify
-            nobs_tensor = torch.from_numpy(nobs).unsqueeze(0).float().to(args.device) # [1, T, 20]
+            nobs_tensor = torch.from_numpy(nobs).unsqueeze(0).float().to(args.device) # [1, n_obs_steps, 20]
             
             # Flatten for model cond
             cond = nobs_tensor.reshape(1, -1)
             
-            # 2. Generate Action
+            # 2. Generate Action (returns unnormalized action trajectory)
             with torch.no_grad():
                 noise = torch.randn(1, args.horizon, action_dim, device=args.device)
-                naction = policy(noise, cond) # [1, T, 2]
+                action = policy(noise, cond) # [1, T, 2]
                 
-            # Unnormalize
-            naction = naction.detach().cpu().numpy()[0] # [T, 2]
-            action = normalizer['action'].unnormalize(naction)
+            action = action.detach().cpu().numpy()[0] # [T, 2]
             
             # 3. Execute
             # Receding horizon: execute first k steps
-            start = step_count
-            end = min(step_count + args.exec_steps, 300) # max steps
-            
             for j in range(args.exec_steps):
                 if j >= len(action): break
                 

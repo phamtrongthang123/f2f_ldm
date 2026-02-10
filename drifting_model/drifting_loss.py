@@ -128,7 +128,7 @@ def _drift_normalize(V, eps=1e-8):
     # Flatten locations and samples: compute E over all L*N vectors
     # lambda = sqrt(E[||V||^2 / C])
     lam = (V.pow(2).sum(dim=-1).mean() / C).sqrt()
-    return lam.clamp(min=eps)
+    return lam.detach().clamp(min=eps)
 
 
 def _compute_single_feature_loss(feat_gen, feat_pos, feat_neg, feat_unc,
