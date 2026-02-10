@@ -229,7 +229,14 @@ def compute_drifting_loss(
     Returns:
         total_loss: scalar loss
     """
-    total_loss = torch.tensor(0.0, device=gen_features[0].device)
+    total_loss = torch.tensor(0.0)
+    if len(gen_features) > 0:
+        total_loss = total_loss.to(gen_features[0].device)
+    elif gen_latent is not None:
+        total_loss = total_loss.to(gen_latent.device)
+    else:
+        # Fallback (should not happen in valid usage)
+        total_loss = total_loss.to(torch.device("cpu"))
 
     for j in range(len(gen_features)):
         loss_j = _compute_single_feature_loss(

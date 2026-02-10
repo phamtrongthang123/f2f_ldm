@@ -1,94 +1,78 @@
-# Drifting Models with Latent-MAE Feature Encoder
+# Drifting Models for Robotics Control
 
-This repository implements **Drifting Models** for one-step generative modeling, using a custom **Latent-MAE** feature encoder for efficient and high-quality training on ImageNet.
+This repository reproduces the **Robotics Control** results from the Drifting Model paper. It applies the Drifting Model (a one-step generative model) to multiple tasks (Push-T, Lift, Can, Square, Kitchen) using the Diffusion Policy codebase conventions.
 
-## Environment Setup
+## 1. Environment Setup
+
+Create a conda environment with the necessary dependencies:
 
 ```bash
-conda create -n drifting python=3.11 -y
-conda activate drifting
-pip install -r requirements.txt
-# or using uv
-pip install uv
-uv pip install -r requirements.txt
+conda env create -f environment_robotics.yaml
+conda activate drifting_robotics
 ```
 
-## Data Preparation
+## 2. Data Preparation
 
-### 1. ImageNet Dataset
-1. Download `ILSVRC2012_img_train.tar` and `ILSVRC2012_img_val.tar`.
-2. Extract them into a folder structure suitable for `torchvision.datasets.ImageFolder` (e.g., `dataset/imagenet/train/...` and `dataset/imagenet/val/...`).
-   * You can use [this script](https://github.com/pytorch/examples/blob/main/imagenet/extract_ILSVRC.sh) for extraction.
+We use the datasets from the Diffusion Policy project.
 
-### 2. Pre-compute Latents (Recommended)
-To speed up training, pre-encode all ImageNet images into the SD-VAE latent space (32x32x4).
+1.  **Clone the Diffusion Policy repository** (already included if you see `diffusion_policy/` folder).
+2.  **Download the datasets**:
 
-**Using SLURM:**
 ```bash
-sbatch scripts/slurm_precompute.sh
+bash download_data.sh
 ```
-*   Input: `./dataset/imagenet` (Default)
-*   Output: `./dataset/imagenet_latents`
 
-**Manual Run:**
+This will download `pusht.zip`, `robomimic_*.zip`, etc., to `data/` and extract them.
+
+## 3. Training
+
+Train the Drifting Policy on a specific task.
+
+**Push-T:**
 ```bash
-python data/imagenet.py \
-    --imagenet_dir ./dataset/imagenet \
-    --output_dir ./dataset/imagenet_latents \
-    --batch_size 64
+python train_robotics.py --task pusht --epochs 300
 ```
 
-## Training Pipeline
-
-The training consists of two stages: first training the feature encoder, then training the generator.
-
-### Stage 1: Train Latent-MAE Feature Encoder
-We pre-train a ResNet-style Masked Autoencoder (MAE) directly on the VAE latents. This encoder provides the feature space for the drifting loss.
-
-**Using SLURM:**
+**Robomimic Tasks (Lift, Can, Square):**
 ```bash
-sbatch scripts/slurm_train_mae.sh
+python train_robotics.py --task lift --data_dir data/robomimic_lift_ph.hdf5
 ```
-*   Trains for 192 epochs on single GPU (effective batch size 8192 via gradient accumulation).
-*   Saves checkpoints to `checkpoints/mae/`.
 
-**Manual Run:**
+**Kitchen:**
 ```bash
-python train_mae.py \
-    --latent_dir ./dataset/imagenet_latents \
-    --output_dir ./checkpoints/mae \
-    --base_width 256
+python train_robotics.py --task kitchen --data_dir data/kitchen
 ```
 
-### Stage 2: Train Drifting Generator
-Train the DiT-based generator using the drifting objective and the frozen MAE encoder from Stage 1.
+- **Model**: A 1D DiT-based generator (`models/policy.py`).
+- **Loss**: Drifting Loss on raw action trajectories.
 
-**Using SLURM:**
+## 4. Evaluation
+
+Evaluate the trained policy in the simulation (requires MuJoCo for non-PushT tasks).
+
 ```bash
-sbatch scripts/slurm_train_generator.sh
+python eval_robotics.py \
+    --ckpt checkpoints/robotics/pusht/epoch_300.pt \
+    --render
 ```
-*   Config: `configs/ablation_default.yaml`
-*   Requires `checkpoints/mae/mae_final.pt` (ensure this exists or update config).
 
-**Manual Run (Multi-GPU):**
+## HPC Training
+
+Use the provided SLURM script. You can configure the task and other parameters using environment variables:
+
 ```bash
-torchrun --nproc_per_node=8 train_imagenet.py \
-    --config configs/ablation_default.yaml \
-    --latent_dir ./dataset/imagenet_latents \
-    --output_dir ./checkpoints \
-    --bf16
+# Default (Push-T)
+sbatch scripts/slurm_train_robotics.sh
+
+# Specific Task (e.g., Lift)
+export TASK=lift
+export DATA_DIR=data/robomimic_lift_ph.hdf5
+sbatch scripts/slurm_train_robotics.sh
 ```
-
-## Configuration
-
-Key configurations are in `configs/ablation_default.yaml`:
-*   **Generator**: DiT-B/2 architecture.
-*   **Feature Encoder**: Points to `latent_mae` and the checkpoint path.
-*   **Drifting**: Temperatures, sample counts ($N_{pos}, N_{neg}, N_{uncond}$), and CFG settings.
 
 ## Project Structure
 
-*   `models/`: DiT generator and Latent-MAE architecture.
-*   `data/`: ImageNet loading and on-the-fly/pre-computed latent handling.
-*   `scripts/`: SLURM submission scripts.
-*   `drifting_loss.py`: Vectorized drifting loss computation.
+- `train_robotics.py`: Training script supporting multiple tasks.
+- `eval_robotics.py`: Evaluation script (currently optimized for Push-T).
+- `models/policy.py`: 1D DiT architecture for control.
+- `drifting_loss.py`: Core drifting loss implementation.
