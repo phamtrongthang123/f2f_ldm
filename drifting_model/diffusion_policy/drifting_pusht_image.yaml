@@ -156,7 +156,7 @@ training:
   debug: false
   device: cuda:0
   gradient_accumulate_every: 1
-  lr_scheduler: cosine
+  lr_scheduler: constant_with_warmup
   lr_warmup_steps: 500
   max_train_steps: null
   max_val_steps: null
