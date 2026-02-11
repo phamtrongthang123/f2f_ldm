@@ -161,7 +161,7 @@ class TrainDriftingUnetHybridWorkspace(BaseWorkspace):
                             train_sampling_batch = batch
 
                         # compute loss
-                        raw_loss = self.model.compute_loss(batch)
+                        raw_loss, metrics = self.model.compute_loss(batch)
                         loss = raw_loss / cfg.training.gradient_accumulate_every
                         loss.backward()
 
@@ -185,6 +185,7 @@ class TrainDriftingUnetHybridWorkspace(BaseWorkspace):
                             'epoch': self.epoch,
                             'lr': lr_scheduler.get_last_lr()[0]
                         }
+                        step_log.update(metrics)
 
                         is_last_batch = (batch_idx == (len(train_dataloader)-1))
                         if not is_last_batch:
@@ -222,7 +223,7 @@ class TrainDriftingUnetHybridWorkspace(BaseWorkspace):
                                 leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                             for batch_idx, batch in enumerate(tepoch):
                                 batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                                loss = self.model.compute_loss(batch)
+                                loss, _ = self.model.compute_loss(batch)
                                 val_losses.append(loss)
                                 if (cfg.training.max_val_steps is not None) \
                                     and batch_idx >= (cfg.training.max_val_steps-1):

@@ -192,5 +192,5 @@ class DriftingUnetHybridImagePolicy(BaseImagePolicy):
         y_pos = nactions.reshape(batch_size, -1)
         y_neg = x
         
-        loss = compute_drifting_loss(x, y_pos, y_neg, temperatures=self.temperatures)
-        return loss
+        loss, metrics = compute_drifting_loss(x, y_pos, y_neg, temperatures=self.temperatures)
+        return loss, metrics
