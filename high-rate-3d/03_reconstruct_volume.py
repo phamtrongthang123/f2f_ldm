@@ -16,7 +16,7 @@ Paper Algorithm 1 → implementation mapping:
   x_{0|τ} Tweedie       → (x_τ - σ_τ ε) / α_τ                  (Eq. 3, eq:tweedie)
   y = Ax (measurement)   → inpainting: y = A x                   (Eq. 5, eq:inverse-problem)
   A = elevation row mask  → binary mask operator                  (Eq. 7, eq:observation_zf)
-  DPS guidance (γ)       → jax.grad through ε_θ + Tweedie        (Eq. 9-12, eq:dps-linear-*)
+  DPS guidance (γ)       → jax.vjp through ε_θ + Tweedie         (Eq. 9-12, eq:dps-linear-*)
   TV smoothness (ζ)      → per-step TV gradient                  (Algo 1 line 35-36)
   SeqDiff warm-start     → forward-diffuse previous recon         (Algo 1 line 16-19)
 
@@ -28,15 +28,20 @@ Structure matches Algorithm 1 exactly:
       For all B-planes j (batched):        # inner loop (line 26)
           ε = ε_θ(x_τ, τ)                 # line 27 — predict noise
           x_{0|τ} = (x_τ - σ_τ ε) / α_τ   # line 28 — Tweedie
-          g = ∇_{x_τ} ||y - A x_{0|τ}||   # lines 29-30 — DPS gradient
+          M = y - A x_{0|τ}               # line 29 — measurement error
+          P = (I - σ_τ ∇ε_θ)^T A^T        # line 30 — projection
           x_{τ-1} = α_{τ-1} x_{0|τ} + σ_{τ-1} ε  # line 31 — DDIM
-          x_{τ-1} ← x_{τ-1} - g           # line 32 — DPS correction
-          x_{τ-1} ← A y + (1-A) x_{τ-1}   # projection — data consistency
+          x_{τ-1} += γ/(α_τ·||M||₂) · P(M)       # line 32 — DPS guidance
       EndFor                               # line 33
       Stack B-planes into X_{τ-1}          # line 34
       V ← ∇_X TV_az(X_{τ-1})              # line 35
       X_{τ-1} ← X_{τ-1} - α_{τ-1} ζ V    # line 36
   EndFor                                   # line 37
+
+Note: ZEA's DPS implementation uses L2 norm (not L2²) for the measurement
+error (matching the original DPS codebase). This introduces an implicit
+1/||M||₂ normalization in the gradient. Our manual VJP implementation
+includes this normalization explicitly: γ · P(M) / ||M||₂.
 """
 
 import os
@@ -114,6 +119,7 @@ def one_diffusion_step(
     sigma_tau_minus_1,
     alpha_tau_minus_1,
     gamma,
+    debug=False,
 ):
     """One diffusion step with DPS guidance (Algo 1 lines 27-32).
 
@@ -161,17 +167,68 @@ def one_diffusion_step(
         # (I − σ_τ ∇_{x_τ} ε_θ)^T u = u − σ_τ J^T u
         return u - sigma_tau * vjp_fn(u)[0]
 
-    # Line 30: M ← y − A x_{0|τ}  (measurement error, Eq. 9)
-    M = y - A * x_0_tau
+    PM = P(M)
 
-    # Line 31: g = γ/α_τ · P · M  (DPS gradient, Eq. 10-12)
-    g = gamma / alpha_tau * P(M)
+    M_norm = jnp.sqrt(jnp.sum(M**2)) + 1e-8
 
-    # Line 31: x_{τ-1} = α_{τ-1} x_{0|τ} + σ_{τ-1} ε  (DDIM reverse step)
+    # Paper's Algo 1 (lines 31-32) applies guidance to x_{0|τ} then does DDIM:
+    #   x_0' = x_0 - γPM                          # guidance on x_0
+    #   x_{τ-1} = α_{τ-1} · x_0' + σ_{τ-1} · ε   # DDIM
+    #           = α_{τ-1} · (x_0 - γPM ) + σ_{τ-1} · ε
+    #           = α_{τ-1} · (x_0) + σ_{τ-1} · ε - α_{τ-1} · γPM
+    #
+    # ZEA's implementation (what we do) applies guidance to x_{τ-1} instead:
+    #   x_{τ-1} = α_{τ-1} · x_0 + σ_{τ-1} · ε    # DDIM first
+    #   x_{τ-1} += γ/α · PM/||M||                  # guidance on x_{τ-1}
+    #
+    # Differences: sign (+= not -=), scale (γ/α not α·γ), and ||M||₂ norm.
+    # The paper's sign is inconsistent with its own Eq. 11; ZEA is correct.
+    # ● The Jacobian J = ∂x_{0|τ}/∂x_τ comes from Tweedie:
+
+    #   x_{0|τ} = (x_τ - σ_τ ε_θ(x_τ)) / α_τ
+
+    #   So:
+
+    #   J = ∂x_{0|τ}/∂x_τ = 1/α_τ · (I - σ_τ · ∂ε_θ/∂x_τ)
+
+    #   Then:
+
+    #   J^T A^T M = 1/α_τ · (I - σ_τ ∇ε_θ)^T · A^T · M
+    #             = 1/α_τ · P(M)
+
+    #   where P = (I - σ_τ ∇ε_θ)^T A^T is exactly the paper's line 30 definition.
+
+    #   So the full likelihood score from Eq. 10 is:
+
+    #   +1/σ² · J^T A^T M = +1/(σ² · α_τ) · P(M)
+
+    #   Absorbing 1/(σ² · α_τ) into γ gives +γ P(M).
+
+    #   But Eq. 12 writes -γ P(M). That negative has no justification from the derivation — it's the sign error.
+    # DDIM reverse step (using unmodified x_{0|τ})
     x_tau_minus_1 = alpha_tau_minus_1 * x_0_tau + sigma_tau_minus_1 * epsilon
 
-    # Line 32: x_{τ-1} ← x_{τ-1} + g  (DPS correction)
-    x_tau_minus_1 = x_tau_minus_1 + g
+    # DPS guidance: ∂(γ·||M||₂)/∂x_τ = -γ/(α·||M||)·P(M)
+    # x_{τ-1} -= gradient = x_{τ-1} + γ/(α·||M||)·P(M)
+    x_tau_minus_1 = x_tau_minus_1 + gamma / alpha_tau * PM / M_norm
+
+    # Debug: print stats for first batch only
+    if debug:
+        def _s(name, t):
+            t = np.array(t)
+            return (f"  {name:12s}: "
+                    f"min={float(t.min()):+10.3f}  max={float(t.max()):+10.3f}  "
+                    f"absmax={float(np.abs(t).max()):10.3f}  "
+                    f"nan={bool(np.any(np.isnan(t)))}")
+        print(_s("x_tau", x_tau))
+        print(_s("epsilon", epsilon))
+        print(_s("x_0_tau", x_0_tau))
+        print(_s("M", M))
+        print(f"  ||M||₂      : {float(M_norm):.3f}")
+        print(_s("PM", PM))
+        guidance = gamma / alpha_tau * PM / M_norm
+        print(_s("guidance", guidance))
+        print(_s("x_tau_m1", x_tau_minus_1))
 
     return np.array(x_tau_minus_1), np.array(x_0_tau)
 
@@ -264,8 +321,14 @@ for step in range(start_step, N_STEPS):
     # --- Process ALL B-planes for one diffusion step (Algo 1 lines 26-33) ---
     x_tau_minus_1 = np.empty_like(x_tau)
 
+    # Debug first 10 steps and then every 20th step
+    do_debug = (step - start_step) < 10 or (step + 1) % 20 == 0
+
     for batch_start in range(0, N_az, BATCH_SIZE):
         batch_end = min(batch_start + BATCH_SIZE, N_az)
+
+        # Only print debug for first batch to avoid spam
+        is_first_batch = batch_start == 0
 
         x_tau_minus_1[batch_start:batch_end], _ = one_diffusion_step(
             model,
@@ -277,6 +340,7 @@ for step in range(start_step, N_STEPS):
             sigma_tau_minus_1,
             alpha_tau_minus_1,
             GAMMA,
+            debug=do_debug and is_first_batch,
         )
 
     # --- Stack B-planes into volume X_{τ-1} (Algo 1 line 34) ---
@@ -293,12 +357,18 @@ for step in range(start_step, N_STEPS):
     x_tau = np.transpose(X_tau_minus_1, (1, 0, 2, 3))
 
     # Progress logging
-    if (step + 1) % 20 == 0 or step == start_step:
+    if do_debug:
         tv_val = np.sum(np.abs(np.diff(X_tau_minus_1, axis=1)))
+        x_absmax = np.abs(x_tau_minus_1).max()
+        has_nan = bool(np.any(np.isnan(x_tau_minus_1)))
         print(
             f"Step {step + 1}/{N_STEPS}: TV={tv_val:.4f}, "
-            f"α={alpha_tau_minus_1.reshape(()).item():.4f}"
+            f"|x|_max={x_absmax:.4f}, nan={has_nan}, "
+            f"σ={sigma_tau.reshape(()).item():.4f}, "
+            f"α={alpha_tau.reshape(()).item():.4f} → "
+            f"α'={alpha_tau_minus_1.reshape(()).item():.4f}"
         )
+        print()
 
 # Final output: reconstructed volume (Algo 1 line 38)
 X_reconstructed = np.transpose(x_tau, (1, 0, 2, 3))
