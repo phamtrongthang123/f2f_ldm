@@ -162,3 +162,9 @@ data
 slurm_logs
 checkpoints
 results
+
+# High-rate-3D specific
+cache
+outputs
+media
+EchoNet-Dynamic
