@@ -162,3 +162,16 @@ data
 slurm_logs
 checkpoints
 results
+
+# Non-dehazing projects (excluded from this branch)
+drifting_model/
+high-rate-3d/
+submit.sh
+
+# Reference/helper materials (excluded from this branch)
+dehazing-diffusion/reproduce_helpers/
+dehazing-diffusion/joint_diffusion/images/
+
+# IDE and tool configs
+.vscode/
+.claude/
